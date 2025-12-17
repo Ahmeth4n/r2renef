@@ -1,11 +1,14 @@
 LIBEXT=$(shell r2 -HR2_LIBEXT)
 CFLAGS+=$(shell pkg-config --cflags r_io r_socket)
+CFLAGS+=-Isrc
 LDFLAGS+=$(shell pkg-config --libs r_io r_socket)
 R2_USER_PLUGINS=$(shell r2 -HR2_USER_PLUGINS)
 
 BUILD_DIR=build
 IO_RENEF=$(BUILD_DIR)/io_renef.$(LIBEXT)
-OBJS=$(BUILD_DIR)/io_renef.o
+
+SRCS=src/io_renef.c src/renef_socket.c src/renef_commands.c src/renef_memory.c
+OBJS=$(SRCS:src/%.c=$(BUILD_DIR)/%.o)
 
 all: $(BUILD_DIR) $(IO_RENEF)
 
