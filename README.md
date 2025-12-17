@@ -18,7 +18,7 @@ r2renef is a Radare2 IO plugin that bridges [Radare2](https://rada.re) with [Ren
 
 - **Live Memory Analysis** - Read/write process memory through Radare2
 - **Full r2 Integration** - Use `px`, `pd`, `pf` and all r2 commands on live processes
-- **Renef Commands** - Access Renef's Lua API via `=!` commands
+- **Renef Commands** - Access Renef's Lua API via `:` commands
 - **Module Inspection** - List loaded modules and exports
 - **Memory Search** - Pattern scanning with r2's search capabilities
 - **Hooking Support** - Load Lua scripts and watch hook callbacks in real-time
@@ -80,25 +80,25 @@ Once connected, use standard Radare2 commands:
 Print disassembled function
 ```
 
-### Renef Commands (`=!`)
+### Renef Commands (`:`)
 
 Access Renef functionality directly:
 
 ```bash
 # List applications
-[0x7f8a1c2b0]> =!la                     # List installed apps
+[0x7f8a1c2b0]> :la                     # List installed apps
 
 # Execute Lua code
-[0x7f8a1c2b0]> =!exec Module.list()     # List loaded modules
-[0x7f8a1c2b0]> =!exec Module.find('libc.so')
+[0x7f8a1c2b0]> :exec Module.list()     # List loaded modules
+[0x7f8a1c2b0]> :exec Module.find('libc.so')
 
 # Memory operations
-[0x7f8a1c2b0]> =!md 0x7f8a1c2b0 64      # Memory dump
-[0x7f8a1c2b0]> =!ms DEADBEEF            # Memory search
+[0x7f8a1c2b0]> :md 0x7f8a1c2b0 64      # Memory dump
+[0x7f8a1c2b0]> :ms DEADBEEF            # Memory search
 
 # Hooking
-[0x7f8a1c2b0]> =!l /path/to/script.lua  # Load and execute Lua script
-[0x7f8a1c2b0]> =!watch                   # Watch hook callbacks (Ctrl+C to stop)
+[0x7f8a1c2b0]> :l /path/to/script.lua  # Load and execute Lua script
+[0x7f8a1c2b0]> :watch                   # Watch hook callbacks (Ctrl+C to stop)
 ```
 
 ## Screenshots
@@ -116,12 +116,12 @@ Access Renef functionality directly:
 <p align="center">
   <img src="dist/images/script_load_screenshot.png" alt="r2renef Script Load" width="700"/>
 </p>
-<p align="center"><em>Loading Lua hook script with `=!l` command</em></p>
+<p align="center"><em>Loading Lua hook script with `:l` command</em></p>
 
 <p align="center">
   <img src="dist/images/hook_watch_screenshot.png" alt="r2renef Hook Watch" width="700"/>
 </p>
-<p align="center"><em>Watching hook callbacks with `=!watch` command</em></p>
+<p align="center"><em>Watching hook callbacks with `:watch` command</em></p>
 
 <p align="center">
   <img src="dist/images/memory_patch_screenshot.png" alt="r2renef Memory Patch" width="700"/>
@@ -149,7 +149,7 @@ hits: 2
 0x7f8a1c100 hit0_0 504b0304
 
 # List modules via Renef
-[0x7f8a1c000]> =!exec Module.list()
+[0x7f8a1c000]> :exec Module.list()
 0x7f8a1c000 libc.so
 0x7f8a2d000 linker64
 0x7f8a3e000 libm.so
@@ -159,9 +159,9 @@ hits: 2
 ## Roadmap
 
 - [x] Basic IO (read/seek)
-- [x] Renef command passthrough (`=!`)
-- [x] Script loading (`=!l`)
-- [x] Hook watch (`=!watch`)
+- [x] Renef command passthrough (`:`)
+- [x] Script loading (`:l`)
+- [x] Hook watch (`:watch`)
 - [x] Memory write support
 - [ ] Debug plugin (breakpoints, stepping)
 - [ ] Register access
