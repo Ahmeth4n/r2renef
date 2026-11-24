@@ -1,214 +1,236 @@
-/* r2renef - MIT - Copyright 2025 */
+/* r2renef - MIT - Copyright 2025-2026 */
 
-#include "renef_types.h"
-#include "renef_socket.h"
+#include <r_io.h>
+#include <r_lib.h>
+
 #include "renef_commands.h"
+#include "renef_maps.h"
 #include "renef_memory.h"
+#include "renef_session.h"
 
 RIOPlugin r_io_plugin_r2renef;
 
-static char *__system(RIO *io, RIODesc *desc, const char *cmd);
-static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode);
-static bool __check(RIO *io, const char *pathname, bool many);
-static bool __close(RIODesc *desc);
+/* renef_server serves one client at a time: a second connection is
+ * accepted by the kernel but never answered. Refuse it here instead of
+ * letting it run into timeouts. */
+#define RN_MAX_SESSIONS 8
+static pthread_mutex_t g_sessions_lock = PTHREAD_MUTEX_INITIALIZER;
+static RenefSession *g_sessions[RN_MAX_SESSIONS];
 
-static bool __close(RIODesc *desc) {
-    RenefUserData *userdata = desc->data;
-    if (userdata) {
-        if (userdata->socket && userdata->socket == g_socket) {
-            r_socket_close(g_socket);
-            r_socket_free(g_socket);
-            g_socket = NULL;
-        }
-        if (userdata->sb) {
-            r_strbuf_free(userdata->sb);
-        }
-        R_FREE(desc->data);
-    }
-    return true;
+static bool session_busy(const char *host, const char *port) {
+	bool busy = false;
+	int i;
+	pthread_mutex_lock (&g_sessions_lock);
+	for (i = 0; i < RN_MAX_SESSIONS; i++) {
+		RenefSession *o = g_sessions[i];
+		if (o && rn_conn_is_open (&o->conn) && !strcmp (o->conn.host, host) && !strcmp (o->conn.port, port)) {
+			busy = true;
+		}
+	}
+	pthread_mutex_unlock (&g_sessions_lock);
+	return busy;
+}
+
+static void session_register(RenefSession *s, bool add) {
+	int i;
+	pthread_mutex_lock (&g_sessions_lock);
+	for (i = 0; i < RN_MAX_SESSIONS; i++) {
+		if (add && !g_sessions[i]) {
+			g_sessions[i] = s;
+			break;
+		}
+		if (!add && g_sessions[i] == s) {
+			g_sessions[i] = NULL;
+		}
+	}
+	pthread_mutex_unlock (&g_sessions_lock);
 }
 
 static bool __check(RIO *io, const char *pathname, bool many) {
-    return r_str_startswith(pathname, SOCKETURI);
+	return r_str_startswith (pathname, SOCKETURI);
+}
+
+static bool __close(RIODesc *desc) {
+	RenefSession *s = desc? desc->data: NULL;
+	if (s) {
+		session_register (s, false);
+		rn_session_free (s);
+		desc->data = NULL;
+	}
+	return true;
+}
+
+/* first line of a reply, without its newline */
+static char *first_line(const RnBuf *b) {
+	const char *d = b->data? b->data: "";
+	const char *nl = strchr (d, '\n');
+	return r_str_ndup (d, nl? (int)(nl - d): (int)strlen (d));
 }
 
 static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode) {
-    if (!__check(io, pathname, 0)) {
-        return NULL;
-    }
+	const char *err = NULL;
+	RnUri uri;
+	RnBuf reply;
+	RIODesc *desc = NULL;
 
-    pathname += strlen(SOCKETURI);
-    RenefUserData *userdata = R_NEW0(RenefUserData);
-    if (!userdata) {
-        return NULL;
-    }
+	if (!__check (io, pathname, false)) {
+		return NULL;
+	}
+	const char *host = getenv ("RENEF_HOST");
+	const char *port = getenv ("RENEF_PORT");
+	if (!rn_parse_uri (pathname, R_STR_ISNOTEMPTY (host)? host: RN_DEFAULT_HOST,
+			R_STR_ISNOTEMPTY (port)? port: RN_DEFAULT_PORT, &uri, &err)) {
+		R_LOG_ERROR ("renef: %s", err);
+		return NULL;
+	}
+	if (session_busy (uri.host, uri.port)) {
+		R_LOG_ERROR ("renef: already connected to %s:%s; renef_server serves one client at a time", uri.host, uri.port);
+		return NULL;
+	}
+	RenefSession *s = rn_session_new ();
+	if (!s) {
+		return NULL;
+	}
+	rn_buf_init (&reply);
+	s->io = io;
+	s->spawn = uri.spawn;
+	s->target = strdup (uri.target);
 
-    R_MODES r_mode;
+	RnStatus st = rn_conn_connect (&s->conn, uri.host, uri.port);
+	if (st != RN_OK) {
+		R_LOG_ERROR ("renef: cannot connect to %s:%s (%s). Is renef_server running and the port forwarded?",
+			uri.host, uri.port, st == RN_TIMEOUT? "timed out": "refused or unreachable");
+		goto fail;
+	}
+	const char *fm = getenv ("RENEF_FRAMING");
+	RnFramingMode mode_f = RN_FRAMING_AUTO;
+	if (fm && (!strcmp (fm, "off") || !strcmp (fm, "0") || !strcmp (fm, "legacy"))) {
+		mode_f = RN_FRAMING_OFF;
+	} else if (fm && (!strcmp (fm, "on") || !strcmp (fm, "1"))) {
+		mode_f = RN_FRAMING_ON;
+	}
+	st = rn_conn_probe (&s->conn, mode_f);
+	if (st != RN_OK) {
+		R_LOG_ERROR ("renef: %s:%s does not answer (%s)%s", uri.host, uri.port, rn_status_str (st),
+			st == RN_TIMEOUT? ". Is another client connected? renef_server serves one at a time.": "");
+		goto fail;
+	}
+	R_LOG_INFO ("renef: connected to %s:%s, %s protocol", uri.host, uri.port, s->conn.framed? "framed": "legacy");
+	s->paged = s->conn.framed;
 
-    userdata->sb = r_strbuf_new("");
+	/* spawn waits for the app to start and the agent to be injected */
+	int tmo = rn_env_int ("RENEF_SPAWN_TIMEOUT", 60, 1, 3600) * 1000;
+	char *cmd = r_str_newf ("%s %s", uri.spawn? "spawn": "attach", uri.target);
+	st = cmd? rn_conn_request (&s->conn, cmd, strlen (cmd), RN_END_LINE, tmo, &reply): RN_ERROR;
+	free (cmd);
+	if (st != RN_OK) {
+		R_LOG_ERROR ("renef: %s %s: %s", uri.spawn? "spawn": "attach", uri.target, rn_status_str (st));
+		goto fail;
+	}
+	/* "OK <pid>" for spawn, "OK" for attach; anything else is the reason */
+	const char *ok = reply.data;
+	while (ok && strncmp (ok, "OK", 2)) {
+		ok = strchr (ok, '\n');
+		ok = ok? ok + 1: NULL;
+	}
+	if (!ok || (ok[2] != ' ' && ok[2] != '\n' && ok[2] != '\r' && ok[2] != '\0')) {
+		char *line = first_line (&reply);
+		R_LOG_ERROR ("renef: %s %s failed: %s", uri.spawn? "spawn": "attach", uri.target,
+			R_STR_ISNOTEMPTY (line)? line: "empty reply");
+		free (line);
+		goto fail;
+	}
+	s->pid = uri.spawn? atoi (ok + 2): atoi (uri.target);
+	R_LOG_INFO ("renef: %s %s, pid %d", uri.spawn? "spawned": "attached to", uri.target, s->pid);
 
-    if (!g_socket) {
-        g_socket = r_socket_new(false);
-        if (!g_socket) {
-            R_LOG_ERROR("Failed to create socket");
-            R_FREE(userdata);
-            return NULL;
-        }
-
-        if (!r_socket_connect(g_socket, "127.0.0.1", "1907", R_SOCKET_PROTO_TCP, 0)) {
-            R_LOG_ERROR("Failed to connect to Renef");
-            r_socket_free(g_socket);
-            g_socket = NULL;
-            R_FREE(userdata);
-            return NULL;
-        }
-
-        R_LOG_INFO("Renef injection waiting... sock_fd: %d", g_socket->fd);
-
-        char *path_copy = strdup(pathname);
-        char *command_name = strtok(path_copy, "/");
-        char *inject_target = strtok(NULL, "/");
-
-        if (!inject_target) {
-            R_LOG_ERROR("Invalid URI format");
-            free(path_copy);
-            r_socket_close(g_socket);
-            r_socket_free(g_socket);
-            g_socket = NULL;
-            R_FREE(userdata);
-            return NULL;
-        }
-
-        char *mode_str = strdup(command_name);
-        r_mode = (strcmp(command_name, RENEF_SPAWN_COMMAND) == 0) ? SPAWN : ATTACH;
-
-        size_t spawn_cmd_len = strlen(command_name) + strlen(inject_target) + 3;
-        char *spawn_cmd = (char*)malloc(spawn_cmd_len);
-        sprintf(spawn_cmd, "%s %s\n", command_name, inject_target);
-
-        int p_send = r_socket_write(g_socket, (ut8*)spawn_cmd, strlen(spawn_cmd));
-
-        R_FREE(spawn_cmd);
-        R_FREE(path_copy);
-
-        if (p_send < 0) {
-            R_LOG_ERROR("Failed to send spawn command");
-            R_FREE(mode_str);
-            r_socket_close(g_socket);
-            r_socket_free(g_socket);
-            g_socket = NULL;
-            R_FREE(userdata);
-            return NULL;
-        }
-
-        char response[64] = {0};
-        r_socket_block_time(g_socket, true, 30, 0);
-        int sp_response = r_socket_read(g_socket, (ut8*)response, sizeof(response) - 1);
-        if (sp_response < 0) {
-            R_LOG_ERROR("Failed to receive spawn response");
-            R_FREE(mode_str);
-            r_socket_close(g_socket);
-            r_socket_free(g_socket);
-            g_socket = NULL;
-            R_FREE(userdata);
-            return NULL;
-        }
-
-        if (strncmp(response, "OK", 2) == 0) {
-            if (r_mode == SPAWN)
-                userdata->pid = atoi(response + 3);
-            else
-                userdata->pid = atoi(inject_target);
-        } else {
-            R_LOG_ERROR("Invalid response: %s", response);
-            R_FREE(mode_str);
-            r_socket_close(g_socket);
-            r_socket_free(g_socket);
-            g_socket = NULL;
-            R_FREE(userdata);
-            return NULL;
-        }
-
-        R_LOG_INFO("Injection completed. Mode: %s PID: %d", mode_str, userdata->pid);
-
-        ut64 libc_base = get_libc_base(userdata);
-
-        if (libc_base == (ut64)-1) {
-            R_LOG_ERROR("Failed to receive spawn response");
-            R_FREE(mode_str);
-            r_socket_close(g_socket);
-            r_socket_free(g_socket);
-            g_socket = NULL;
-            R_FREE(userdata);
-            return NULL;
-        }
-
-        io->off = libc_base;
-        userdata->size = UT64_MAX;
-        R_FREE(mode_str);
-    }
-
-    userdata->socket = g_socket;
-    userdata->mode = r_mode;
-
-    return r_io_desc_new(io,
-            &r_io_plugin_r2renef,
-            pathname,
-            R_PERM_RW | (rw & R_PERM_X),
-            mode,
-            userdata);
+	/* The full URI is the descriptor's name: radare2 reopens a file
+	 * whose descriptor reports a different one. */
+	desc = r_io_desc_new (io, &r_io_plugin_r2renef, pathname, R_PERM_RW | (rw & R_PERM_X), mode, s);
+	if (!desc) {
+		goto fail;
+	}
+	s->fd = desc->fd;
+	session_register (s, true);
+	rn_buf_fini (&reply);
+	return desc;
+fail:
+	rn_buf_fini (&reply);
+	rn_session_free (s);
+	return NULL;
 }
 
 static char *__system(RIO *io, RIODesc *desc, const char *cmd) {
-    if (R_STR_ISEMPTY(cmd)) {
-        return NULL;
-    }
+	RenefSession *s = desc? desc->data: NULL;
+	if (!s) {
+		return NULL;
+	}
+	s->io = io;
+	if (R_STR_ISEMPTY (cmd)) {
+		/* `=!` without a command: radare2 "initialises the io
+		 * subsystem" this way once the descriptor is in place */
+		rn_init_hook (s);
+		return NULL;
+	}
+	return rn_command (s, cmd);
+}
 
-    if (!desc || !desc->data) {
-        return NULL;
-    }
+/* The three callbacks below are only consulted by radare2 for plugins
+ * that set .isdbg, which this one deliberately does not: with it,
+ * r_core_bin_load() takes the debugger path (r_debug_select() of the
+ * target's pid in the HOST debugger, then r_bin_open() of the URI). They
+ * are provided so that anything asking through the plugin gets the truth. */
+static int __getpid(RIODesc *desc) {
+	RenefSession *s = desc? desc->data: NULL;
+	return s? s->pid: -1;
+}
 
-    if (!g_socket) {
-        return NULL;
-    }
-
-    RenefUserData *rnf = desc->data;
-
-    if (!rnf->sb) {
-        return NULL;
-    }
-
-    if (strncmp(cmd, RENEF_LOAD_COMMAND " ", strlen(RENEF_LOAD_COMMAND) + 1) == 0) {
-        return handle_load_cmd(desc, cmd);
-    }
-
-    if (strcmp(cmd, RENEF_WATCH_COMMAND) == 0) {
-        return handle_watch_cmd(desc);
-    }
-
-    return execute_renef_command((char *)cmd, rnf);
+static bool __getbase(RIODesc *desc, ut64 *base) {
+	RenefSession *s = desc? desc->data: NULL;
+	if (!s || !base) {
+		return false;
+	}
+	bool amb = false;
+	const RnModule *m = rn_module_find (s, "libc.so", &amb);
+	if (!m && s->n_modules) {
+		m = &s->modules[0];
+	}
+	if (!m) {
+		return false;
+	}
+	*base = m->base;
+	return true;
 }
 
 RIOPlugin r_io_plugin_r2renef = {
-    .meta = {
-        .name = "r2renef",
-        .desc = "Renef IO plugin for radare2",
-        .license = "MIT",
-    },
-    .uris = SOCKETURI,
-    .open = __open,
-    .close = __close,
-    .seek = renef_lseek,
-    .read = renef_read,
-    .check = __check,
-    .write = renef_write,
-    .system = __system,
+	.meta = {
+		.name = "r2renef",
+		.desc = "Renef IO plugin for radare2 (renef://[host[:port]/]spawn/<pkg> or attach/<pid>)",
+		.license = "MIT",
+	},
+	.uris = SOCKETURI,
+	.open = __open,
+	.close = __close,
+	.seek = renef_lseek,
+	.read = renef_read,
+	.check = __check,
+	.write = renef_write,
+	.system = __system,
+	.getpid = __getpid,
+	.gettid = __getpid,
+	.getbase = __getbase,
+	.isdbg = false,
 };
 
 #ifndef R2_PLUGIN_INCORE
 R_API RLibStruct radare_plugin = {
-    .type = R_LIB_TYPE_IO,
-    .data = &r_io_plugin_r2renef,
-    .version = R2_VERSION
+	.type = R_LIB_TYPE_IO,
+	.data = &r_io_plugin_r2renef,
+	.version = R2_VERSION,
+	.pkgname = "r2renef",
+#ifdef R2_ABIVERSION
+	/* radare2 >= 6.0 refuses a plugin built against another ABI instead
+	 * of only comparing major.minor of the version string */
+	.abiversion = R2_ABIVERSION,
+#endif
 };
 #endif
