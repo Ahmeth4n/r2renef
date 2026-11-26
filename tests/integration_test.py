@@ -320,10 +320,12 @@ def t_maps_and_flags(mode):
                        ":dm", ":il", ":ie libtarget.so", ":is libtarget.so", ".:ie* libtarget.so",
                        "f~sym.libtarget", ":dm libcrypto", ".:il*", ":ie nosuchlib.so"])
     check(sum(1 for l in lines(r.out) if " fd: " in l) == 16, "expected 16 io maps")
-    has(r.out, "0x%x - 0x%x rwx libc.so" % (LIBC + 0x4000, LIBC + 0xffff))
+    # radare2 6.2.6's `om` prints the io-map perm and the underlying range's
+    # perm as two columns; they are equal here (RENEF_MAPS test default).
+    has(r.out, "0x%x - 0x%x rwx rwx libc.so" % (LIBC + 0x4000, LIBC + 0xffff))
     # execute-only code is readable for radare2 where the server can read it
-    has(r.out, "0x%x - 0x%x %s libcrypto.so" % (CRYPTO + 0x4000, CRYPTO + 0xbfff,
-                                                "rwx" if mode == "framed" else "-wx"))
+    perm = "rwx" if mode == "framed" else "-wx"
+    has(r.out, "0x%x - 0x%x %s %s libcrypto.so" % (CRYPTO + 0x4000, CRYPTO + 0xbfff, perm, perm))
     has(r.out, "0x%x 73728 lib.libc.so" % LIBC)
     has(r.out, "17 ranges, 4 modules, 16 io maps")
     has(r.out, "1506 exports of libc.so flagged")        # several pages of output
