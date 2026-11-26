@@ -1,6 +1,7 @@
 /* r2renef - MIT - Copyright 2025-2026 */
 
 #include "renef_commands.h"
+#include "renef_java.h"
 #include "renef_maps.h"
 #include "renef_memory.h"
 #include "renef_session.h"
@@ -36,6 +37,16 @@ static const char HELP[] =
 	"  :unhook <id>|all           remove hook(s)\n"
 	"  :hookgen [addr]            print a hook script template for addr (default $$)\n"
 	"  :bt[*] [addr]              last backtrace captured by a :hook -b hook\n"
+	"java\n"
+	"  :jc [-n max] [filter]      classes of the app (name contains <filter>)\n"
+	"  :jm [-s] [-a] <class> [filter]\n"
+	"                             methods and constructors of a class\n"
+	"  :jhook <class> <method> [(types)] [-r <value>] [-k] [-b] [-n <N>] [-s] [-e <lua>]\n"
+	"                             hook a Java method (:jhook alone explains the options);\n"
+	"                             :hooks lists Java hooks as [jN], :unhook jN removes one\n"
+	"  :jni <class> | -a [filter]  native methods and the functions they run (flags sym.jni.*)\n"
+	"  :jcode <class> <method> [(types)]\n"
+	"                             seek to the compiled code of a Java method\n"
 	"tracing and search\n"
 	"  :strace <a,b,..> [-f lib]  trace syscalls (output is asynchronous: :watch)\n"
 	"  :strace -a | -c <category> | --list [category] | --active | --stop | -u <a,b>\n"
@@ -989,7 +1000,8 @@ static char *cmd_hooks(RenefSession *s) {
 	while (p && *p) {
 		const char *nl = strchr (p, '\n');
 		const char *lb = strchr (p, '[');
-		if (lb && (!nl || lb < nl)) {
+		/* "[jN] ..." is a Java hook: those are not tracked here */
+		if (lb && (!nl || lb < nl) && lb[1] >= '0' && lb[1] <= '9') {
 			int id = atoi (lb + 1);
 			const char *t = strstr (lb, "target=");
 			RnHook *known = hook_by_id (s, id);
@@ -1052,7 +1064,8 @@ static char *cmd_unhook(RenefSession *s, const char *args) {
 		while (s->n_hooks) {
 			hook_remove (s, &s->hooks[s->n_hooks - 1]);
 		}
-	} else if (out.data && !strncmp (out.data, "Hook ", 5)) {
+	} else if (out.data && !strncmp (out.data, "Hook ", 5) && out.data[5] >= '0' && out.data[5] <= '9') {
+		/* "Hook j3 removed" is a Java hook: those have no flag here */
 		RnHook *h = hook_by_id (s, atoi (out.data + 5));
 		if (h) {
 			hook_remove (s, h);
@@ -1554,6 +1567,21 @@ static char *dispatch(RenefSession *s, const char *cmd) {
 	}
 	if (IS ("unhook") && !star) {
 		return cmd_unhook (s, args);
+	}
+	if (IS ("jc") && !star) {
+		return rn_cmd_jc (s, args);
+	}
+	if (IS ("jm") && !star) {
+		return rn_cmd_jm (s, args);
+	}
+	if (IS ("jhook") && !star) {
+		return rn_cmd_jhook (s, args);
+	}
+	if (IS ("jni") && !star) {
+		return rn_cmd_jni (s, args);
+	}
+	if (IS ("jcode") && !star) {
+		return rn_cmd_jcode (s, args);
 	}
 	if (IS ("hookgen") && !star) {
 		return cmd_hookgen (s, args);

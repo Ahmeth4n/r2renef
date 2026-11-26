@@ -19,6 +19,7 @@ r2renef is a Radare2 IO plugin that bridges [Radare2](https://rada.re) with [Ren
 - **Live Memory Analysis** - Read/write process memory through Radare2 (`px`, `pd`, `pf`, `/x`, `w` ...)
 - **Maps and Flags** - The target's memory ranges become io maps; modules, exports and symbols become flags
 - **Hook at Cursor** - `:hook` hooks the function you are looking at; hooks show up as flags and comments
+- **Java Side** - `:jc` finds classes, `:jm` lists a class's methods, `:jhook` hooks a Java method and prints its calls with decoded arguments - no Lua, no JNI signatures
 - **Backtraces, Syscall Tracing, Search** - `:bt`, `:strace`, `:/x` run inside the target
 - **Renef Commands** - Everything else after `:` goes to `renef_server` as is (`:exec`, `:la`, `:ms` ...)
 - **Scripts** - `:l file.lua` runs a local Lua script in the target, `:watch` follows hook output
@@ -104,6 +105,11 @@ and the rest of the Renef CLI keep working.
 | `:hook [addr] [-i\|-g[=lib]] [-r] [-b] [-e <lua>]` | hook the function at `addr` (default `$$`) |
 | `:hooks`, `:unhook <id>\|all` | list / remove hooks; flags and comments follow |
 | `:hookgen [addr]` | print a hook script template for `addr` |
+| `:jc [-n max] [filter]` | classes of the app whose name contains `filter` |
+| `:jm [-s] [-a] <class> [filter]` | methods and constructors of a class (`-s`: with JNI signatures, `-a`: compiler-made ones too) |
+| `:jhook <class> <method> [(types)] [options]` | hook a Java method; see [Java methods](#java-methods) |
+| `:jni [-n] <class>` / `:jni [-n] -a [filter]` | native methods and the functions they run, flagged as `sym.jni.<Class>_<method>` |
+| `:jcode <class> <method> [(types)]` | seek to the code of a Java method: its compiled code, or the function of a native method |
 | `:bt[*] [addr]` | last backtrace captured by a `:hook -b` hook |
 | `:strace <a,b,..> [-f lib]` | trace syscalls (`-a`, `-c <category>`, `-u`, `--list`, `--active`, `--stop`) |
 | `:/x [-m module] <hex>`, `:/ [-m module] <text>` | search inside the target (`??` or `..` = any byte); hits become `renef.hit<n>` flags |
@@ -144,6 +150,94 @@ Two kinds of hook exist and they are not interchangeable:
   pointers, not libraries loaded later. The agent patches at most 64 GOT slots
   per hook, so `-g` alone on a popular libc function covers only some callers:
   name the caller.
+
+### Java methods
+
+The Java side needs no script and no JNI signature:
+
+```bash
+[0x7100004140]> :jc pin                       # classes of the app, by name
+com.example.app.auth.PinManager
+[0x7100004140]> :jm PinManager                # the short name is enough when it is unique
+class com.example.app.auth.PinManager extends java.lang.Object
+  new PinManager(String)
+  boolean check(String)
+  boolean check(String, int)
+  static native boolean verifyNative(byte[])
+[0x7100004140]> :jhook PinManager check       # every `check`; (String) picks one
+hook j0 installed: boolean check(String)
+hook j1 installed: boolean check(String, int)
+[0x7100004140]> :watch
+[j0] PinManager.check("1234") -> false
+[j1] PinManager.check("4821", 3) -> true
+```
+
+Strings, numbers, booleans and `byte[]` are printed with their content, so
+hooks on crypto classes show keys and data as they pass:
+
+```bash
+[0x7100004140]> :jhook javax.crypto.spec.SecretKeySpec new (byte[], String)
+[j2] new SecretKeySpec(byte[16] 3a9f01c2…, "AES")
+```
+
+| Option | Effect |
+|---|---|
+| `(types)` | one overload, written as in Java: `(String, int)`, `()` for no parameters |
+| `-r <value>` | return this instead: `true`/`false`, a number, `"text"` or `null` |
+| `-k` | do not run the original at all (for checks that throw; with `-r` that value is returned) |
+| `-b` | log the Java stack on every call |
+| `-n <N>` | stop printing after N calls; the hook stays and keeps counting |
+| `-s` | print other objects with `toString()` and show the receiver of the call |
+| `-e <lua>` | body of `onEnter(args)` instead of the logger |
+
+`<method>` `new` is the constructor. `:hooks` lists Java hooks as `[jN]` with
+their call counters and `:unhook jN` removes one.
+
+#### From a Java method to its code
+
+A `native` method is declared in Java and implemented in a library. `:jni`
+finds the function behind it - also when the library registered it at run
+time and exports no `Java_...` name for it:
+
+```bash
+[0x7100004140]> :jni PinManager
+com.example.app.auth.PinManager
+  0x7100004200   libtarget.so+0x4200          static native boolean verifyNative(byte[])
+                 sym.jni.PinManager_verifyNative
+1 native method: 1 bound
+[0x7100004140]> s sym.jni.PinManager_verifyNative
+[0x7100004200]> pdf                           # ...and :hook works on it as on any function
+```
+
+`:jni -a` does this for every class of the app. A method nothing is bound to
+yet is looked up by its JNI name in the app's own libraries; if no library
+exports it, it has no function until its library is loaded.
+
+`:jcode <class> <method>` seeks to the machine code ART runs for a Java
+method (`pd`, `pdf`): ahead-of-time compiled code in an `.oat`/`.odex` file or
+code the JIT produced. A method that has none yet runs in the interpreter and
+there is nothing to seek to.
+
+Both need Renef 0.4.0 or later (`Java.methodInfo`).
+
+Good to know:
+
+- Other objects are printed as `Class@id`. `toString()` is not called unless
+  you ask with `-s`: it runs code of the app, inside the hook.
+- `:jc` lists the classes of the app's own dex files. Framework classes are
+  not listed but can be named (`:jm java.io.File`); a few common packages are
+  tried for a bare name (`:jm File`, `:jhook Activity onResume`). Classes that
+  a protector loads at run time through its own class loader are not found.
+- Interface and abstract methods have no code to hook: hook the class that
+  implements them. A method carries one hook at a time.
+- A hook whose counter in `:hooks` stays at 0 while the method obviously runs
+  has most likely been inlined into its callers by ART.
+- `float` and `double` parameters reach the method unchanged but are printed
+  as `<float>` / `<double>`; only the first seven other parameters are shown.
+- radare2 treats `~`, `;`, `|` and `@` specially: write a `-e` body that needs
+  them into a file and load it with `:l`.
+- Needs Renef 0.4.0 or later on Android 12 or later for hooks that survive
+  exceptions and garbage collection.
 
 ### Reading memory
 

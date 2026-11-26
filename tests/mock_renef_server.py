@@ -18,6 +18,9 @@ target, exactly as it would kill the real one.
 
 Extra commands for tests (never sent by r2renef itself):
   mock.fire hook <index> [x0 .. x7 [retval]]   run a hook's callbacks
+  mock.fire jhook <index> <result|-|!> [args]  run a Java hook's callbacks; values are
+                                               s:text n:5 b:0aff o:a.b.Class null, the
+                                               result "-" is none and "!" an exception
   mock.fire syscall <name> <args> <ret>        emit a syscall trace line
   mock.fire_in <ms> <same as mock.fire>        ... after a delay
   mock.late <ms> <text>                        write <text> to the client later
@@ -250,6 +253,7 @@ class Agent:
         self.lock = threading.Lock()
         self.crashed = False
         self.hooks = []      # dicts: addr, caller, removed
+        self.jhooks = []     # dicts: key, removed, hits
         self.log = log
 
     def _request(self, kind, body):
@@ -279,6 +283,10 @@ class Agent:
                     idx, addr, caller = rest.split(b" ", 2)
                     self.hooks.append({"addr": int(addr), "caller": caller.decode(), "removed": False})
                     self.log("hook", index=int(idx), addr="0x%x" % int(addr), caller=caller.decode())
+                elif tag == b"J":
+                    idx, key = rest.split(b" ", 1)
+                    self.jhooks.append({"key": key.decode(), "removed": False, "hits": 0})
+                    self.log("jhook", index=int(idx), key=key.decode())
                 elif tag == b"C":
                     self.crashed = True
                     self.log("crash", why=rest.decode("utf-8", "replace"))
@@ -393,6 +401,9 @@ class Session:
         parts = spec.split()
         if len(parts) >= 2 and parts[0] == b"hook" and parts[1].isdigit():
             self.hook_hits[int(parts[1])] = self.hook_hits.get(int(parts[1]), 0) + 1
+        if len(parts) >= 2 and parts[0] == b"jhook" and parts[1].isdigit() \
+                and int(parts[1]) < len(self.agent.jhooks):
+            self.agent.jhooks[int(parts[1])]["hits"] += 1
         with self.buf_lock:
             self.agent_buf += b"".join(l + b"\n" for l in lines)
 
@@ -580,6 +591,15 @@ class Session:
                 out += "  [%d] target=0x%x hits=%d\n" % (i, h["addr"], self.hook_hits.get(i, 0))
             else:
                 out += "  [%d] target=0x%x\n" % (i, h["addr"])
+        # agents since 0.4.0 list Java hooks too, once there is one
+        jhooks = self.agent.jhooks
+        if jhooks and not self.srv.args.no_java_list:
+            out += "Java hooks: %d\n" % len(jhooks)
+            for i, h in enumerate(jhooks):
+                if h["removed"]:
+                    out += "  [j%d] (removed)\n" % i
+                else:
+                    out += "  [j%d] %s hits=%d\n" % (i, h["key"], h["hits"])
         self.send(out.encode())
 
     def cmd_events(self, args, full):
@@ -613,9 +633,12 @@ class Session:
             return
         n = int(lines[0]) if lines else 0
         if spec == "all":
-            for h in self.agent.hooks:
+            for h in self.agent.hooks + self.agent.jhooks:
                 h["removed"] = True
             self.send(b"Removed %d hook(s)\n" % n)
+        elif n and spec.startswith("j"):
+            self.agent.jhooks[int(spec[1:])]["removed"] = True
+            self.send(b"Hook %s removed\n" % spec.encode())
         elif n:
             self.agent.hooks[int(spec)]["removed"] = True
             self.send(b"Hook %d removed\n" % int(spec))
@@ -835,8 +858,14 @@ def main():
                     help="the queue's drop notice arrives with the output of the next exec")
     ap.add_argument("--exec-stall-ms", type=int, default=0,
                     help="stay busy this long after every exec (public renef <= 0.3.7 does so for 5000 ms)")
+    ap.add_argument("--no-method-info", action="store_true",
+                    help="the agent has no Java.methodInfo (renef 0.4.0)")
+    ap.add_argument("--no-java-list", action="store_true",
+                    help="`hooks` does not list Java hooks (renef before 0.4.0)")
     ap.add_argument("--once", action="store_true", help="exit after the first client disconnects")
     args = ap.parse_args()
+    if args.no_method_info:
+        os.environ["MOCK_NO_METHOD_INFO"] = "1"   # read by mock_agent.lua
     if args.port == 1907:
         sys.exit("refusing to listen on 1907: that is the real renef_server port")
     if not shutil.which(args.lua):

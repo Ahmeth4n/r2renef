@@ -13,7 +13,7 @@ IO_RENEF=$(BUILD_DIR)/io_renef.$(LIBEXT)
 # renef_proto.c and renef_socket.c do not use radare2: the unit tests link
 # them on their own.
 SRCS=src/io_renef.c src/renef_session.c src/renef_memory.c src/renef_maps.c \
-     src/renef_commands.c src/renef_proto.c src/renef_socket.c
+     src/renef_commands.c src/renef_java.c src/renef_proto.c src/renef_socket.c
 OBJS=$(SRCS:src/%.c=$(BUILD_DIR)/%.o)
 HDRS=$(wildcard src/*.h)
 
@@ -48,6 +48,10 @@ integration: $(IO_RENEF)
 	python3 tests/integration_test.py --plugin $(IO_RENEF)
 
 test check: unit integration
+
+# src/renef_java_lua.h is src/renef_java.lua as a C array (checked in).
+lua-header:
+	tools/lua2h.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

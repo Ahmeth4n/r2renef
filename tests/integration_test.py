@@ -17,6 +17,7 @@ one the run is skipped with exit status 77.
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -766,6 +767,208 @@ def t_cache(mode):
     check(n >= 3, "page fetched %d times with the cache off" % n)
 
 
+def t_java_classes(mode):
+    r = session(mode, [
+        ":jc",
+        ":jc pin",
+        ":jc -n 2",
+        ":jc nothinglikethis",
+        ":jm PinManager",
+        ":jm -s PinManager chec",
+        ":jm -a PinManager label",
+        ":jm Inner",
+        ":jm Util",
+        ":jm File",
+        ":jm Nope",
+        ":jm com.example.app.net.Checker",
+        ":jm",
+    ])
+    has(r.out, "com.example.app.PinManager\n")
+    has(r.out, "6 classes in the app's own dex files")
+    has(r.out, "1 of the app's 6 classes match")
+    has(r.out, "2 of 6 matching classes shown (6 in the app)")
+    has(r.out, "0 of the app's 6 classes match")
+    has(r.out, "class com.example.app.PinManager extends java.lang.Object implements com.example.app.net.Checker")
+    has(r.out, "  new PinManager(String)\n")
+    has(r.out, "  boolean check(String)\n")
+    has(r.out, "  boolean check(String, int)\n")
+    has(r.out, "  static native boolean verifyNative(byte[])\n")
+    has(r.out, "  static int score(float, long, Object)\n")
+    has(r.out, "7 listed, 1 compiler-made not shown (-a)")
+    has(r.out, "(Ljava/lang/String;I)Z")
+    has(r.out, "  Object label()\n")                        # only with -a
+    has(r.out, "class com.example.app.Outer$Inner extends java.lang.Object")
+    has(r.out, "2 classes are called Util, give the full name:\n  com.example.a.Util\n  com.example.b.Util\n")
+    has(r.out, "class java.io.File extends java.lang.Object implements java.io.Serializable")
+    has(r.out, "class not found: Nope (:jc nope searches the app's classes)")
+    has(r.out, "interface com.example.app.net.Checker\n  abstract boolean verify(String)")
+    has(r.out, "usage: :jm [-s] [-a] <class> [filter]")
+    lacks(r.out, "@r2:")
+
+
+def t_java_hooks(mode):
+    r = session(mode, [
+        ":sync libtarget.so",
+        ":hook 0x%x" % (TARGET + 0x4100),                  # native hook #0, to be left alone
+        ":jhook PinManager check",                          # both overloads: j0, j1
+        ":jhook PinManager verifyNative -r true",           # j2
+        ":jhook PinManager new",                            # j3
+        ":jhook PinManager reset -k",                       # j4
+        ":jhook PinManager label -n 1",                     # j5 (the compiler-made twin is left out)
+        ":jhook PinManager score -s",                       # j6
+        ":jhook PinManager check (String)",                 # already hooked
+        ":jhook Checker verify",                            # interface
+        ":jhook PinManager check (int)",                    # no such overload
+        ":jhook PinManager nope",
+        ":jhook Nope run",
+        ":jhook PinManager check -r",                       # usage
+        ":hooks",
+        ":mock.fire jhook 0 n:0 o:com.example.app.PinManager s:1234",
+        ":mock.fire jhook 1 n:1 o:com.example.app.PinManager s:a%20\"b\" n:7",
+        ":mock.fire jhook 2 n:0 b:00ff10",
+        ":mock.fire jhook 3 - o:com.example.app.PinManager s:seed",
+        ":mock.fire jhook 4 - o:com.example.app.PinManager",
+        ":mock.fire jhook 5 s:first o:com.example.app.PinManager",
+        ":mock.fire jhook 5 s:second o:com.example.app.PinManager",
+        ":mock.fire jhook 5 s:third o:com.example.app.PinManager",
+        ":mock.fire jhook 6 n:42 n:9 o:java.io.File",
+        ":mock.fire jhook 0 ! o:com.example.app.PinManager s:throws",
+        ":mock.fire jhook 0 n:1 o:com.example.app.PinManager s:after",
+        ":watch 0.3",
+        ":unhook j0",
+        ":mock.fire jhook 0 n:0 o:com.example.app.PinManager s:gone",
+        ":watch 0.2",
+        ":hooks",
+        "f~hook.~?",
+        ":jhook PinManager check (String) -e print('custom '..type(args[2]))",   # j7
+        ":mock.fire jhook 7 n:0 o:com.example.app.PinManager s:x",
+        ":watch 0.2",
+        ":unhook all",
+        "f~hook.~?",
+    ])
+    has(r.out, "hook j0 installed: boolean check(String)\nhook j1 installed: boolean check(String, int)")
+    has(r.out, "hook j2 installed: static native boolean verifyNative(byte[])")
+    has(r.out, "hook j3 installed: new PinManager(String)")
+    has(r.out, "hook j5 installed: String label()")
+    lacks(r.out, "installed: Object label()")
+    has(r.out, "not hooked: boolean check(String)\n  com/example/app/PinManager.check(Ljava/lang/String;)Z is already hooked (j0)")
+    has(r.out, "not hooked: abstract boolean verify(String)\n  abstract or interface method: it has no code.")
+    has(r.out, "no check with these parameter types. There is:\n  boolean check(String)\n  boolean check(String, int)\n")
+    has(r.out, "com.example.app.PinManager has no method nope (:jm PinManager lists them)")
+    has(r.out, "class not found: Nope")
+    has(r.out, "usage: :jhook <class> <method>")
+    has(r.out, "  [j2] com/example/app/PinManager.verifyNative([B)Z hits=0")
+    # the calls, as :watch shows them
+    has(r.out, '[j0] PinManager.check("1234") -> false')
+    has(r.out, '[j1] PinManager.check("a \\"b\\"", 7) -> true')
+    has(r.out, "[j2] PinManager.verifyNative(byte[3] 00ff10) -> false  => true")
+    has(r.out, "[mock] j2: result replaced by 1")
+    has(r.out, '[j3] new PinManager("seed")')
+    has(r.out, "[j4] PinManager.reset()  (not run)")
+    has(r.out, "[mock] j4: original not run")
+    has(r.out, '[j5] PinManager.label() -> "first"')
+    has(r.out, "[j5] PinManager.label: further calls are not printed")
+    lacks(r.out, '"second"')
+    lacks(r.out, '"third"')
+    has(r.out, '[j6] PinManager.score(<float>, 9, Object "mock java.io.File") -> 42')
+    # a call that threw is still reported, by the next call on that thread
+    has(r.out, '[j0] PinManager.check("throws")\n')
+    has(r.out, '[j0] PinManager.check("after") -> true')
+    # :unhook jN removes the Java hook and leaves the native hook #0 alone
+    has(r.out, "Hook j0 removed")
+    lacks(r.out, '"gone"')
+    has(r.out, "  [j0] (removed)")
+    has(r.out, "hook j7 installed: boolean check(String)")
+    has(r.out, "custom number")
+    counts = [l for l in lines(r.out) if l in ("0", "1", "2")]
+    check(counts[-2:] == ["1", "0"], "native hook flag must survive :unhook j0 and go with :unhook all: %r" % counts)
+    lacks(r.out, "@r2:")
+    lacks(r.out, "[java]")
+
+
+def t_java_native(mode):
+    r = session(mode, [
+        ":jni PinManager",
+        ":jni MainActivity",
+        ":jni Checker",
+        "f~sym.jni",
+        ":jni -n -a",
+        ":jni -a pinman",
+        ":jni",
+        ":jni Nope",
+        ":jcode PinManager verifyNative",
+        "s",
+        ":jcode PinManager check (String, int)",
+        "s",
+        ":jcode PinManager check",
+        ":jcode PinManager check (int)",
+        ":jcode PinManager nope",
+        ":jcode",
+        "f~sym.java",
+    ])
+    a_native, a_export = TARGET + 0x4200, TARGET + 0x4140
+    has(r.out, "com.example.app.PinManager\n  0x%-12x libtarget.so+0x4200" % a_native)
+    has(r.out, "static native boolean verifyNative(byte[])\n")
+    has(r.out, "1 native method: 1 bound\n")
+    # nothing is bound to these yet: one is found by the name libtarget.so exports
+    has(r.out, "  0x%-12x libtarget.so+0x4140" % a_export)
+    has(r.out, "native boolean check(String)   (not bound yet: by its export name)")
+    has(r.out, "  not bound")
+    has(r.out, "native void late_bound()")
+    has(r.out, "2 native methods: 0 bound, 1 found by export name, 1 not bound yet")
+    has(r.out, "the class declares no native methods")
+    has(r.out, "0x%x 1 sym.jni.PinManager_verifyNative" % a_native)
+    has(r.out, "0x%x 1 sym.jni.MainActivity_check" % a_export)
+    has(r.out, "3 native methods in 6 classes: 1 bound, 1 found by export name, 1 not bound yet")
+    has(r.out, "1 native method in 1 classes: 1 bound")
+    has(r.out, "usage: :jni [-n] <class>")
+    has(r.out, "class not found: Nope")
+    # :jcode seeks when there is one answer
+    has(r.out, "static native boolean verifyNative(byte[])   (com.example.app.PinManager)\n"
+               "  native function at 0x%x (libtarget.so+0x4200)  sym.jni.PinManager_verifyNative" % a_native)
+    has(r.out, "boolean check(String, int)   (com.example.app.PinManager)\n"
+               "  compiled code at 0x%x (libtarget.so+0x4340)  sym.java.PinManager_check" % (TARGET + 0x4340))
+    seeks = [l for l in lines(r.out) if l.startswith("0x") and len(l) <= 14]
+    check(seeks[:2] == ["0x%x" % a_native, "0x%x" % (TARGET + 0x4340)], "seeks after :jcode: %r" % seeks)
+    has(r.out, "several methods: seek to the one you want")
+    has(r.out, "no check with these parameter types. There is:\n  boolean check(String)\n")
+    has(r.out, "com.example.app.PinManager has no method nope")
+    has(r.out, "usage: :jcode <class> <method> [(types)]")
+    lacks(r.out, "@r2:")
+
+
+def t_java_native_old_agent(mode):
+    r = session(mode, [":jni PinManager", ":jcode PinManager check", ":jm PinManager"],
+                mock_args=("--no-method-info",))
+    has(r.out, "this renef has no Java.methodInfo (it came with 0.4.1)")
+    has(r.out, "  boolean check(String)\n")                # the rest keeps working
+
+
+def t_java_old_server(mode):
+    # a server that does not list Java hooks: they work, their number is not known
+    r = session(mode, [
+        ":jhook PinManager check (String)",
+        ":mock.fire jhook 0 n:1 o:com.example.app.PinManager s:1234",
+        ":watch 0.3",
+    ], mock_args=("--no-java-list",))
+    has(r.out, "hook installed: boolean check(String)")
+    has(r.out, '[java] PinManager.check("1234") -> true')
+
+
+def t_java_helper_in_sync(mode):
+    # the checked-in header must be the current Lua file
+    src = os.path.join(os.path.dirname(HERE), "src")
+    with open(os.path.join(src, "renef_java.lua"), "rb") as f:
+        lua = f.read()
+    with open(os.path.join(src, "renef_java_lua.h")) as f:
+        data = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-f]{2})", f.read()))
+    check(data == lua + b"\0", "src/renef_java_lua.h is stale: run `make lua-header`")
+    m = re.search(rb"local VERSION = (\d+)", lua)
+    with open(os.path.join(src, "renef_java.c")) as f:
+        c = re.search(r"#define RN_JAVA_VERSION (\d+)", f.read())
+    check(m and c and int(m.group(1)) == int(c.group(1)), "RN_JAVA_VERSION differs from the Lua VERSION")
+
+
 def interrupt_when(mode, cmds, wait_for, env=None):
     """runs r2, sends it SIGINT once the server has received a command containing `wait_for`"""
     import signal
@@ -870,6 +1073,8 @@ TESTS = [
     (t_strace, BOTH), (t_search, BOTH), (t_hookgen, BOTH), (t_scripts, BOTH),
     (t_stale_reply, BOTH), (t_unsolicited, BOTH), (t_fragmented, BOTH), (t_forced_modes, ("framed",)),
     (t_exec_stall, ("legacy",)), (t_output_queue, ("framed",)),
+    (t_java_classes, BOTH), (t_java_hooks, BOTH), (t_java_native, BOTH), (t_java_native_old_agent, ("framed",)),
+    (t_java_old_server, BOTH), (t_java_helper_in_sync, ("framed",)),
     (t_interrupt, BOTH), (t_second_open, BOTH), (t_open_failures, BOTH), (t_cache, ("framed",)),
     (t_xom_read, BOTH), (t_event_channel, ("framed",)),
 ]

@@ -15,6 +15,7 @@ sources = [
 	'src/renef_memory.c',
 	'src/renef_maps.c',
 	'src/renef_commands.c',
+	'src/renef_java.c',
 ] + proto_sources
 
 lib = library('iorenef', sources,
