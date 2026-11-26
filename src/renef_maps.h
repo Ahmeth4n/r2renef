@@ -30,5 +30,6 @@ char *rn_cmd_dm(RenefSession *s, const char *args, bool star);
 char *rn_cmd_modules(RenefSession *s, const char *args, bool star);
 char *rn_cmd_symbols(RenefSession *s, const char *args, bool star, bool symtab);
 char *rn_cmd_sync(RenefSession *s, const char *args);
+char *rn_cmd_diff(RenefSession *s, const char *args);
 
 #endif

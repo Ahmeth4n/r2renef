@@ -106,6 +106,8 @@ and the rest of the Renef CLI keep working.
 | `:hooks`, `:unhook <id>\|all` | list / remove hooks; flags and comments follow |
 | `:hookgen [addr]` | print a hook script template for `addr` |
 | `:call <addr> [retType [arg...]]` | call the function at `addr` now and print its result; see [Calling a function](#calling-a-function) |
+| `:patch <addr> [-i\|-g[=lib]] [-r <value>] [-e <lua>]` | the original never runs; see [The original never runs](#the-original-never-runs) |
+| `:diff [module] [maxbytes]` | compare the module's on-disk file against the live process; see [Is this code still what's on disk?](#is-this-code-still-what's-on-disk) |
 | `:jc [-n max] [filter]` | classes of the app whose name contains `filter` |
 | `:jm [-s] [-a] <class> [filter]` | methods and constructors of a class (`-s`: with JNI signatures, `-a`: compiler-made ones too) |
 | `:jhook <class> <method> [(types)] [options]` | hook a Java method; see [Java methods](#java-methods) |
@@ -177,6 +179,62 @@ A failed call (the address is not mapped, not inside a loaded library, not
 executable, or the callee itself errors) prints why instead of a result.
 `:call` never writes to the target's code - it is safe to use on
 execute-only (`xom`) functions that `:hook -i` would refuse.
+
+### The original never runs
+
+`:patch` is `:hook` taken one step further: instead of observing a call,
+it replaces the function outright. The real body - whatever it would have
+logged or done - never executes at all.
+
+```bash
+[0x7100004140]> :patch $$ -r 1
+patch #0 installed at 0x7100004140 (libtarget.so+0x4140, inline): the original never runs
+```
+
+With no `-r`/`-e`, it logs the incoming arguments and returns 0 - a quick
+way to neuter a check without deciding on a return value yet. `-r <value>`
+fixes the return to a number (`-r 0`, `-r 1`, ...). `-e <lua>` replaces the
+logger with your own `function(args) ... end` body - write your own
+`return`. `-i`/`-g[=lib]` are the same inline/PLT-GOT choice `:hook` makes;
+same execute-only caveat, too. Unlike `:hook`, `:patch` always needs an
+explicit address - silently neutering whatever the cursor happens to sit on
+is not a good default.
+
+```bash
+[0x7000004200]> :patch $$ -e return 1
+patch #1 installed at 0x7000004200 (libc.so+0x4200, inline): the original never runs
+```
+
+`:hooks` lists a patch the same way it lists a hook, and `:unhook <id>`
+removes it.
+
+### Is this code still what's on disk?
+
+`:diff` compares a module's on-disk file against the live process, byte for
+byte, over its executable range - the same question an integrity check asks
+about itself, pointed the other way:
+
+```bash
+[0x7100004140]> :diff libtarget.so
+libtarget.so: comparing 32768 bytes of /data/app/.../lib/arm64/libtarget.so against the live process at 0x7100004000
+identical
+```
+
+After a `:patch` or an inline `:hook` on that module, the same command shows
+exactly what changed:
+
+```bash
+[0x7100004140]> :diff libtarget.so
+libtarget.so: comparing 32768 bytes of /data/app/.../lib/arm64/libtarget.so against the live process at 0x7100004000
+  0x7100004140-0x7100004143 (libtarget.so+0x4140): 4 bytes differ
+4 bytes in 1 range differ from the file on disk
+```
+
+The default module is the one at `$$`; a second argument caps how many
+bytes are compared (default 32768). Besides checking your own patch, this
+is a way to notice a function a *different* hook already landed on before
+you got there, or runtime-unpacked code that only exists live - either
+shows up as "the file disagrees with the running process."
 
 ### Java methods
 

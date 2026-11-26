@@ -2,6 +2,8 @@
 
 #include "renef_maps.h"
 #include "renef_session.h"
+#include "renef_memory.h"
+#include "renef_proto.h"
 
 /*
  * The target's memory map is read from /proc/self/maps through Lua's io
@@ -865,5 +867,238 @@ char *rn_cmd_sync(RenefSession *s, const char *args) {
 			rn_buf_appendf (&out, "%ld symbols of %s flagged\n", n, args);
 		}
 	}
+	return rn_buf_steal (&out, NULL);
+}
+
+/* ---- :diff ---- */
+
+typedef struct {
+	ut8 *out;
+	size_t max;
+	int got;        /* bytes decoded, -1 if none yet */
+	char err[160];
+} DiffCtx;
+
+static void diff_line(void *user, const char *line, size_t len) {
+	DiffCtx *ctx = user;
+	if (len >= 1 && line[0] == 'D') {
+		line++;
+		len--;
+		ctx->got = rn_hex_decode (line, len, ctx->out, ctx->max);
+	} else if (len >= 1 && line[0] == 'E') {
+		line++;
+		len--;
+		while (len && *line == ' ') {
+			line++;
+			len--;
+		}
+		size_t n = len < sizeof (ctx->err) - 1? len: sizeof (ctx->err) - 1;
+		memcpy (ctx->err, line, n);
+		ctx->err[n] = '\0';
+	}
+}
+
+/* Reads `len` bytes of live memory at `addr` through the same cached,
+ * XOM-aware path radare2's own reads use (renef_read()) - no new Lua, no
+ * risk of faulting on execute-only pages. */
+static int read_live(RenefSession *s, ut64 addr, size_t len, ut8 *out) {
+	ut64 saved = s->off;
+	RIODesc fake;
+	memset (&fake, 0, sizeof (fake));
+	fake.data = s;
+	size_t done = 0;
+	/* One renef_read() call can come back short of `count` for reasons
+	 * that are not "nothing more to read" (radare2's own reads never ask
+	 * for more than it is willing to hand back in one call) - keep asking
+	 * from where it left off until it stops making progress. */
+	while (done < len) {
+		s->off = addr + done;
+		int got = renef_read (s->io, &fake, out + done, (int)(len - done));
+		if (got <= 0) {
+			break;
+		}
+		done += (size_t)got;
+	}
+	s->off = saved;
+	return (int)done;
+}
+
+/* Reads `len` bytes of the on-disk file at file offset `off`, through the
+ * agent (it is the one actually on the device). One exec, hex-encoded,
+ * same convention as the live-read path above it mirrors. */
+static int read_disk(RenefSession *s, const char *path, ut64 off, size_t len, ut8 *out, RnBuf *err) {
+	RnBuf lua;
+	rn_buf_init (&lua);
+	bool ok = rn_buf_puts (&lua, "local f=File.read(") && rn_lua_quote (&lua, path, strlen (path))
+		&& rn_buf_puts (&lua, ") if not f then print('" RN_TAG "E cannot read the file on the device') return end ")
+		&& rn_buf_appendf (&lua, "local st,ln=0x%" PFMT64x "+1,%d ", off, (int)len)
+		&& rn_buf_puts (&lua, "if st>#f then print('" RN_TAG "E the file is shorter than that offset') return end ")
+		&& rn_buf_puts (&lua, "if st+ln-1>#f then ln=#f-st+1 end ")
+		&& rn_buf_puts (&lua, "if not __r2h then local h={} for i=0,255 do h[string.char(i)]=string.format('%02x',i) end __r2h=h end ")
+		&& rn_buf_puts (&lua, "print('" RN_TAG "D'..(f:sub(st,st+ln-1):gsub('.',__r2h)))");
+	if (!ok) {
+		rn_buf_fini (&lua);
+		rn_buf_puts (err, "out of memory\n");
+		return -1;
+	}
+	DiffCtx ctx = { out, len, -1, "" };
+	RnBuf reply, other;
+	bool failed = false;
+	rn_buf_init (&reply);
+	rn_buf_init (&other);
+	RnStatus st = rn_exec (s, lua.data, 0, &reply);
+	rn_buf_fini (&lua);
+	if (st == RN_OK) {
+		rn_scan_reply (s, &reply, diff_line, &ctx, &other, &failed);
+	}
+	rn_buf_fini (&reply);
+	rn_buf_fini (&other);
+	if (st != RN_OK) {
+		rn_buf_appendf (err, "%s\n", rn_status_str (st));
+		return -1;
+	}
+	if (ctx.got < 0) {
+		rn_buf_appendf (err, "%s\n", *ctx.err? ctx.err: "the script did not complete");
+		return -1;
+	}
+	return ctx.got;
+}
+
+static const char *skip_ws(const char *p) {
+	while (*p == ' ' || *p == '\t') {
+		p++;
+	}
+	return p;
+}
+
+/* copies the next blank-delimited token and advances *p past it */
+static char *take_token(const char **p) {
+	const char *s = skip_ws (*p);
+	const char *e = s;
+	while (*e && *e != ' ' && *e != '\t') {
+		e++;
+	}
+	*p = skip_ws (e);
+	size_t n = (size_t)(e - s);
+	char *t = malloc (n + 1);
+	if (t) {
+		memcpy (t, s, n);
+		t[n] = '\0';
+	}
+	return t;
+}
+
+char *rn_cmd_diff(RenefSession *s, const char *args) {
+	RnBuf out;
+	rn_buf_init (&out);
+	const char *p = skip_ws (args);
+	char *libarg = NULL;
+	size_t want = RN_LUA_READ_MAX;
+
+	if (*p) {
+		libarg = take_token (&p);
+		if (*p) {
+			char *sz = take_token (&p);
+			long v = sz? strtol (sz, NULL, 0): 0;
+			free (sz);
+			if (v > 0) {
+				want = (size_t)v;
+			}
+		}
+	}
+	if (want > RN_LUA_READ_MAX) {
+		want = RN_LUA_READ_MAX;
+	}
+
+	if (!rn_ranges_ensure (s, &out)) {
+		free (libarg);
+		return rn_buf_steal (&out, NULL);
+	}
+	const RnModule *mod;
+	bool amb = false;
+	mod = libarg? rn_module_find (s, libarg, &amb): rn_module_at (s, s->off);
+	if (amb) {
+		rn_buf_appendf (&out, "'%s' matches several modules (see :il %s); use the full path\n", libarg, libarg);
+		free (libarg);
+		return rn_buf_steal (&out, NULL);
+	}
+	if (!mod) {
+		rn_buf_appendf (&out, "'%s' is not a loaded library\n", libarg? libarg: "the module at $$");
+		free (libarg);
+		return rn_buf_steal (&out, NULL);
+	}
+	free (libarg);
+
+	const RnRange *r = NULL;
+	for (size_t i = 0; i < s->n_ranges; i++) {
+		RnRange *c = &s->ranges[i];
+		if (c->path && mod->path && !strcmp (c->path, mod->path) && c->perms[2] == 'x') {
+			r = c;
+			break;
+		}
+	}
+	if (!r) {
+		rn_buf_appendf (&out, "no executable range found for %s\n", mod->name);
+		return rn_buf_steal (&out, NULL);
+	}
+	size_t len = (size_t)(r->end - r->start);
+	if (len > want) {
+		len = want;
+	}
+	ut64 off = r->start - mod->base;
+
+	ut8 *live = calloc (1, len);
+	ut8 *disk = calloc (1, len);
+	if (!live || !disk) {
+		free (live);
+		free (disk);
+		rn_buf_puts (&out, "out of memory\n");
+		return rn_buf_steal (&out, NULL);
+	}
+
+	int got_live = read_live (s, r->start, len, live);
+	if (got_live <= 0) {
+		rn_buf_appendf (&out, "could not read live memory at 0x%" PFMT64x "\n", r->start);
+		free (live);
+		free (disk);
+		return rn_buf_steal (&out, NULL);
+	}
+	int got_disk = read_disk (s, mod->path, off, len, disk, &out);
+	if (got_disk <= 0) {
+		free (live);
+		free (disk);
+		return rn_buf_steal (&out, NULL);
+	}
+
+	size_t n = (size_t)got_live < (size_t)got_disk? (size_t)got_live: (size_t)got_disk;
+	size_t i = 0, ranges = 0, diff_bytes = 0;
+	rn_buf_appendf (&out, "%s: comparing %zu bytes of %s against the live process at 0x%" PFMT64x "\n",
+		mod->name, n, mod->path, r->start);
+	while (i < n) {
+		if (live[i] == disk[i]) {
+			i++;
+			continue;
+		}
+		size_t start = i;
+		while (i < n && live[i] != disk[i]) {
+			i++;
+			diff_bytes++;
+		}
+		rn_buf_appendf (&out, "  0x%" PFMT64x "-0x%" PFMT64x " (%s+0x%" PFMT64x "): %zu byte%s differ\n",
+			r->start + start, r->start + i - 1, mod->name, off + start, i - start, i - start == 1? "": "s");
+		ranges++;
+	}
+	if (ranges == 0) {
+		rn_buf_puts (&out, "identical\n");
+	} else {
+		rn_buf_appendf (&out, "%zu byte%s in %zu range%s differ from the file on disk\n",
+			diff_bytes, diff_bytes == 1? "": "s", ranges, ranges == 1? "": "s");
+	}
+	if ((size_t)got_live < len || (size_t)got_disk < len) {
+		rn_buf_appendf (&out, "(only %zu of the requested %zu bytes could be read; compared the common prefix)\n", n, len);
+	}
+
+	free (live);
+	free (disk);
 	return rn_buf_steal (&out, NULL);
 }

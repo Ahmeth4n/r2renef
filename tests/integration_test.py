@@ -645,6 +645,63 @@ def t_call(mode):
     has(r.out, "usage: :call <addr>")
 
 
+def t_patch(mode):
+    r = session(mode, [
+        ":patch 0x%x" % (TARGET + 0x4140),                              # 0: default -> 0, logs args
+        ":patch 0x%x -r 99" % (TARGET + 0x4180),                         # 1: forced return
+        ':patch 0x%x -e return args[0]+args[1]' % (TARGET + 0x41c0),    # 2: custom body
+        ":mock.fire hook 0 11 22",
+        ":mock.fire hook 1 11 22",
+        ":mock.fire hook 2 11 22",
+        ":watch 0.2",
+        ':patch 0x%x -r 1 -e return 1' % (TARGET + 0x4140),             # -r/-e exclude each other
+        ":patch 0x%x -i -g" % (TARGET + 0x4140),                        # -i/-g exclude each other
+        ":patch 0x%x" % (CRYPTO + 0x4000),                              # execute-only: refused
+        ":patch 0x%x -g=libtarget.so" % (LIBC + 0x4240),                # PLT/GOT on an export (strlen)
+        ":patch 0x%x -g" % (LIBC + 0x4244),                             # not an export: refused
+        ":patch 0x%x" % (LIBC + 0x10),                                  # mapped, not executable
+        ":patch",                                                       # usage
+    ])
+    has(r.out, "installed at 0x%x (libtarget.so+0x4140, inline): the original never runs" % (TARGET + 0x4140))
+    has(r.out, "installed at 0x%x (libtarget.so+0x4180, inline): the original never runs" % (TARGET + 0x4180))
+    has(r.out, "installed at 0x%x (libtarget.so+0x41c0, inline): the original never runs" % (TARGET + 0x41c0))
+    has(r.out, "x0=0xb x1=0x16 x2=0x0 x3=0x0 -> 0")                     # default body, args(11,22)
+    has(r.out, "forced return=0x63")                                    # -r 99 (0x63)
+    has(r.out, "[mock] replace @%d: original skipped, returned 0" % (TARGET + 0x4140))
+    has(r.out, "[mock] replace @%d: original skipped, returned 99" % (TARGET + 0x4180))
+    has(r.out, "[mock] replace @%d: original skipped, returned 33" % (TARGET + 0x41c0))  # 11+22
+    has(r.out, "-r and -e exclude each other\n")
+    has(r.out, "-i and -g exclude each other\n")
+    has(r.out, "is in execute-only memory (--xp)")
+    has(r.out, "installed at 0x%x (libc.so+0x4240, plt/got): the original never runs" % (LIBC + 0x4240))
+    has(r.out, "PLT/GOT patch on the symbol 'strlen'")
+    has(r.out, "no exported symbol starts at this address")
+    has(r.out, "not executable: nothing to patch there\n")
+    has(r.out, "usage: :patch <addr>")
+
+
+def t_diff(mode):
+    r = session(mode, [
+        ":diff libc.so",                 # whole default-size (32768) compare, untouched -> identical
+        ":diff libtarget.so 16",          # explicit, smaller size
+        ":diff nosuchlib.so",             # not a loaded library
+        "s 0x%x" % (HEAP + 8),            # mapped, but not inside a module
+        ":diff",
+        ":diff libcrypto.so",             # execute-only: live read goes through /proc/<pid>/mem
+    ])
+    has(r.out, "libc.so: comparing 32768 bytes of %s against the live process at 0x%x\n" % (mock.LIBC, LIBC + 0x4000))
+    has(r.out, "identical")
+    has(r.out, "libtarget.so: comparing 16 bytes of %s against the live process at 0x%x\n" % (mock.LIBTARGET, TARGET + 0x4000))
+    has(r.out, "'nosuchlib.so' is not a loaded library\n")
+    has(r.out, "is not a loaded library\n")
+    if mode == "framed":
+        has(r.out, "libcrypto.so: comparing 32768 bytes of %s against the live process at 0x%x\n" % (mock.LIBCRYPTO, CRYPTO + 0x4000))
+    else:
+        # no memdump command on a legacy connection: refuses rather than
+        # faulting on execute-only memory
+        has(r.out, "could not read live memory at 0x%x\n" % (CRYPTO + 0x4000))
+
+
 def t_scripts(mode):
     script = ('-- a comment with // in it\n'
               'local base = Module.find("libc.so") -- trailing comment\n'
@@ -1097,7 +1154,7 @@ TESTS = [
     (t_write, BOTH), (t_write_unmapped, BOTH), (t_native_search_and_seek, BOTH),
     (t_maps_and_flags, BOTH), (t_maps_modes, BOTH), (t_many_ranges, BOTH),
     (t_hooks, BOTH), (t_hook_safety, BOTH), (t_hooks_from_script, BOTH), (t_hook_custom_body, BOTH),
-    (t_strace, BOTH), (t_search, BOTH), (t_hookgen, BOTH), (t_call, BOTH), (t_scripts, BOTH),
+    (t_strace, BOTH), (t_search, BOTH), (t_hookgen, BOTH), (t_call, BOTH), (t_patch, BOTH), (t_diff, BOTH), (t_scripts, BOTH),
     (t_stale_reply, BOTH), (t_unsolicited, BOTH), (t_fragmented, BOTH), (t_forced_modes, ("framed",)),
     (t_exec_stall, ("legacy",)), (t_output_queue, ("framed",)),
     (t_java_classes, BOTH), (t_java_hooks, BOTH), (t_java_native, BOTH), (t_java_native_old_agent, ("framed",)),

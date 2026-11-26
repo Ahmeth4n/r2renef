@@ -43,6 +43,9 @@ static const char HELP[] =
 	"                             default pointer) to pass args; a number-looking arg is passed\n"
 	"                             as one, anything else as a string; quote an arg (\"...\") to force\n"
 	"                             it to be a string even if it looks like a number\n"
+	"  :patch <addr> [-i|-g[=lib]] [-r <value>] [-e <lua>]\n"
+	"                             the original never runs; always return <value> (0 if neither\n"
+	"                             -r nor -e), or what function(args) ... end in -e returns\n"
 	"java\n"
 	"  :jc [-n max] [filter]      classes of the app (name contains <filter>)\n"
 	"  :jm [-s] [-a] <class> [filter]\n"
@@ -59,6 +62,9 @@ static const char HELP[] =
 	"  :/x [-m module] <hex>      search bytes in the target (?? or .. = any byte)\n"
 	"  :/ [-m module] <text>      search a string in the target\n"
 	"  :cache [flush|<ms>]        page cache lifetime\n"
+	"  :diff [module] [maxbytes]  compare the module's on-disk file against the live\n"
+	"                             process, byte for byte, over its executable range\n"
+	"                             (default module: the one at $$; default size: 32768)\n"
 	"append * to print radare2 commands instead (use as .:il*)\n";
 
 /* ---- small helpers ---- */
@@ -1637,6 +1643,214 @@ done:
 	return finish (&out);
 }
 
+/* ---- :patch ---- */
+
+static char *cmd_patch(RenefSession *s, const char *args) {
+	RnBuf out, lua;
+	char *expr = NULL, *caller = NULL, *body = NULL, *label = NULL, *tag = NULL, *rtok = NULL;
+	bool want_inline = false, want_got = false, want_retval = false;
+	long long retval = 0;
+	const char *p = skip_ws (args);
+	ut64 addr = 0;
+	const char *usage = "usage: :patch <addr> [-i|-g[=lib]] [-r <value>] [-e <lua>]\n"
+		"  -r <value>   never run the original: always return this (0 if neither -r nor -e)\n"
+		"  -e <lua>     body of function(args) ... end instead (write your own return)\n";
+
+	rn_buf_init (&out);
+	rn_buf_init (&lua);
+	if (!*p) {
+		/* Unlike :hook, no $$ default: silently neutering whatever the
+		 * cursor happens to be on is not a good failure mode to default to. */
+		rn_buf_puts (&out, usage);
+		goto done;
+	}
+	while (*p) {
+		if (!strncmp (p, "-e ", 3)) {
+			body = strdup (skip_ws (p + 3));
+			break;
+		}
+		char *tok = take_token (&p);
+		if (!tok) {
+			break;
+		}
+		if (!strcmp (tok, "-i") || !strcmp (tok, "--inline")) {
+			want_inline = true;
+		} else if (!strncmp (tok, "-g", 2) || !strncmp (tok, "--got", 5)) {
+			const char *eq = strchr (tok, '=');
+			want_got = true;
+			free (caller);
+			caller = strdup (eq && eq[1]? eq + 1: "*");
+		} else if (!strcmp (tok, "-r") && *p) {
+			free (rtok);
+			rtok = take_token (&p);
+			char *end = NULL;
+			retval = strtoll (rtok, &end, 0);
+			if (!end || *end) {
+				rn_buf_appendf (&out, "not a number: '%s'\n%s", rtok, usage);
+				free (tok);
+				goto done;
+			}
+			want_retval = true;
+		} else if (tok[0] == '-' && tok[1] && !isdigit ((unsigned char)tok[1])) {
+			rn_buf_appendf (&out, "unknown option %s (see :?)\n", tok);
+			free (tok);
+			goto done;
+		} else if (!expr) {
+			expr = tok;
+			tok = NULL;
+		} else {
+			rn_buf_appendf (&out, "unexpected argument %s (see :?)\n", tok);
+			free (tok);
+			goto done;
+		}
+		free (tok);
+	}
+	if (want_inline && want_got) {
+		rn_buf_puts (&out, "-i and -g exclude each other\n");
+		goto done;
+	}
+	if (want_retval && body) {
+		rn_buf_puts (&out, "-r and -e exclude each other\n");
+		goto done;
+	}
+	if (!eval_addr (s, expr, &addr)) {
+		rn_buf_appendf (&out, "cannot evaluate address '%s'\n", expr? expr: "$$");
+		goto done;
+	}
+	if (s->conn.framed? !rn_ranges_refresh (s, &out): !rn_ranges_ensure (s, &out)) {
+		goto done;
+	}
+	const RnRange *range = rn_range_at (s, addr);
+	const RnModule *mod = rn_module_at (s, addr);
+	if (!range) {
+		rn_buf_appendf (&out, "0x%" PFMT64x " is not mapped in the target\n", addr);
+		goto done;
+	}
+	if (!mod) {
+		rn_buf_appendf (&out, "0x%" PFMT64x " is not inside a loaded library (%s); renef calls are addressed as library+offset\n",
+			addr, *range->path? range->path: "anonymous memory");
+		goto done;
+	}
+	if (range->perms[2] != 'x') {
+		rn_buf_appendf (&out, "0x%" PFMT64x " (%s, %s) is not executable: nothing to patch there\n",
+			addr, mod->name, range->perms);
+		goto done;
+	}
+	if (addr & 3) {
+		rn_buf_appendf (&out, "0x%" PFMT64x " is not aligned to an AArch64 instruction\n", addr);
+		goto done;
+	}
+	label = r_str_newf ("%s+0x%" PFMT64x, mod->name, addr - mod->base);
+	tag = label? r_str_newf ("%s @0x%" PFMT64x, label, addr): NULL;
+	if (!tag) {
+		goto done;
+	}
+	if (!want_inline && !want_got && range->perms[0] != 'r') {
+		/* Same execute-only caveat as :hook -i: an inline replace rewrites
+		 * the function's own first instructions. */
+		rn_buf_appendf (&out,
+			"%s is in execute-only memory (%s).\n"
+			"An inline patch rewrites that code, which crashes the target on renef builds\n"
+			"without the execute-only fixes (before 0.4.0). Choose explicitly:\n"
+			"  :patch 0x%" PFMT64x " -g=<lib>   PLT/GOT: only calls made from <lib> through its PLT;\n"
+			"                          the address must be an exported symbol (-g alone: every library)\n"
+			"  :patch 0x%" PFMT64x " -i         inline patch anyway\n",
+			label, range->perms, addr, addr);
+		goto done;
+	}
+	bool got = want_got;
+	const char *lib = rn_module_luaname (mod);
+
+	bool ok = rn_buf_puts (&lua, "local lib,addr=") && rn_lua_quote (&lua, lib, strlen (lib))
+		&& rn_buf_appendf (&lua, ",0x%" PFMT64x " local b=Module.find(lib) "
+			"if not b then print('" RN_TAG "E the agent does not know '..lib) return end "
+			"if b~=0x%" PFMT64x " then print('" RN_TAG "E '..lib..' resolves to '..string.format('0x%%x',b)"
+			"..' in the agent, not to the module mapped at this address') return end "
+			"local off=addr-b local nm='' ", addr, mod->base);
+	if (ok && got) {
+		ok = rn_buf_puts (&lua, "local ex=Module.exports(lib) nm=nil "
+			"if ex then for i=1,#ex do if ex[i].offset==off then nm=ex[i].name break end end end "
+			"if not nm then print('" RN_TAG "E no exported symbol starts at this address; "
+			"a PLT/GOT patch is resolved by symbol name') return end ");
+	}
+	ok = ok && rn_buf_puts (&lua, "local tag=") && rn_lua_quote (&lua, tag, strlen (tag))
+		&& rn_buf_puts (&lua, " local ok,err=pcall(Interceptor.replace,lib,off,function(args) ");
+	if (ok && body) {
+		ok = rn_buf_puts (&lua, body);
+	} else if (ok && want_retval) {
+		/* tag is already a Lua local (declared just above); only retval,
+		 * a plain number, needs to come from C - %%s/%%d/%%x stay literal
+		 * for Lua's own string.format to consume at runtime. */
+		ok = rn_buf_appendf (&lua, "print(string.format('[patch %%s] tid=%%d forced return=0x%%x',"
+			"tag,Thread.id(),%lld)) return %lld", retval, retval);
+	} else if (ok) {
+		ok = rn_buf_puts (&lua, "print(string.format('[patch %s] tid=%d x0=0x%x x1=0x%x x2=0x%x x3=0x%x -> 0',"
+			"tag,Thread.id(),args[0],args[1],args[2],args[3])) return 0");
+	}
+	ok = ok && rn_buf_puts (&lua, " end");
+	if (ok && got) {
+		ok = rn_buf_puts (&lua, ",") && rn_lua_quote (&lua, caller, strlen (caller));
+	}
+	ok = ok && rn_buf_puts (&lua, ") if ok then print('" RN_TAG "K'..string.format('%x',off)..' '..nm) "
+		"else print('" RN_TAG "E '..tostring(err)) end");
+	if (!ok) {
+		rn_buf_puts (&out, "out of memory\n");
+		goto done;
+	}
+
+	HookCtx ctx;
+	RnBuf reply, other;
+	bool failed = false;
+	memset (&ctx, 0, sizeof (ctx));
+	rn_buf_init (&reply);
+	rn_buf_init (&other);
+	RnStatus st = rn_exec (s, lua.data, 0, &reply);
+	if (st == RN_OK) {
+		rn_scan_reply (s, &reply, hook_line, &ctx, &other, &failed);
+	}
+	rn_buf_fini (&reply);
+	if (st != RN_OK || !ctx.ok) {
+		rn_buf_appendf (&out, "patch at %s failed: %s\n", label,
+			st != RN_OK? rn_status_str (st): (*ctx.err? ctx.err: "the script did not complete"));
+		if (other.len) {
+			rn_buf_append (&out, other.data, other.len);
+		}
+		rn_buf_fini (&other);
+		goto done;
+	}
+	rn_buf_fini (&other);
+	rn_cache_flush (s);   /* an inline patch changed the code at addr */
+
+	int count = server_hook_count (s, NULL);
+	RnHook *h = hook_add (s, count > 0? count - 1: -1, addr, got, label);
+	if (h) {
+		hook_mark (s, h);
+	}
+	char idtxt[24] = "";
+	if (h && h->id >= 0) {
+		snprintf (idtxt, sizeof (idtxt), " #%d", h->id);
+	}
+	rn_buf_appendf (&out, "patch%s installed at 0x%" PFMT64x " (%s, %s): the original never runs\n",
+		idtxt, addr, label, got? "plt/got": "inline");
+	if (got) {
+		rn_buf_appendf (&out,
+			"note: this is a PLT/GOT patch on the symbol '%s'. It replaces calls made through the PLT of\n"
+			"%s%s loaded right now (the agent patches at most 64 GOT slots per hook). Calls from\n"
+			"inside %s itself, calls through function pointers and libraries loaded later still run the original.\n",
+			ctx.name, strcmp (caller, "*")? "": "the libraries", strcmp (caller, "*")? caller: "", mod->name);
+	}
+	rn_buf_puts (&out, ":hooks lists it, :unhook removes it; output (if any) is asynchronous: :watch follows it\n");
+done:
+	free (expr);
+	free (caller);
+	free (body);
+	free (label);
+	free (tag);
+	free (rtok);
+	rn_buf_fini (&lua);
+	return finish (&out);
+}
+
 /* ---- :info / :cache / :watch ---- */
 
 static char *cmd_info(RenefSession *s) {
@@ -1780,6 +1994,9 @@ static char *dispatch(RenefSession *s, const char *cmd) {
 	if (IS ("call") && !star) {
 		return cmd_call (s, args);
 	}
+	if (IS ("patch") && !star) {
+		return cmd_patch (s, args);
+	}
 	if (IS ("bt")) {
 		return cmd_bt (s, args, star);
 	}
@@ -1794,6 +2011,9 @@ static char *dispatch(RenefSession *s, const char *cmd) {
 	}
 	if (IS ("cache") && !star) {
 		return cmd_cache (s, args);
+	}
+	if (IS ("diff") && !star) {
+		return rn_cmd_diff (s, args);
 	}
 #undef IS
 	return passthrough (s, cmd, false);

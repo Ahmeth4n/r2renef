@@ -50,6 +50,28 @@ local function find_range(addr)
 	return nil
 end
 
+-- Reads the backing bytes without the "is this memory readable" check
+-- mem_read makes: a real on-disk file is readable regardless of how any
+-- memory mapping of it happens to be protected (XOM is a mapping property,
+-- not a filesystem one). Shared by mem_read and File.read.
+local function disk_read(addr, n)
+	local out, a = {}, addr
+	while n > 0 do
+		local r = find_range(a)
+		if not r then
+			return nil
+		end
+		local take = math.min(n, r.stop - a)
+		local f = assert(real_open(statedir .. "/" .. r.file, "rb"))
+		f:seek("set", a - r.start)
+		out[#out + 1] = f:read(take)
+		f:close()
+		a = a + take
+		n = n - take
+	end
+	return table.concat(out)
+end
+
 local function mem_read(addr, n)
 	local out, a = {}, addr
 	while n > 0 do
@@ -94,6 +116,28 @@ function print(...)
 end
 
 console = { log = function(msg) emit(msg) end }
+
+-- File.read, for :diff's tests: reconstructs "the file" as the union of a
+-- path's ranges, byte k coming from live memory at <module base> + k - so
+-- it matches memory exactly unless something (:hook/:patch) later writes
+-- to that memory - the real agent's File.read reads an actual, independent
+-- file, but this is enough to test :diff's plumbing and its identical-file
+-- case; the "finds a real difference" case is verified on a real device.
+File = {}
+
+function File.read(path)
+	local lo, hi
+	for _, r in ipairs(S.ranges) do
+		if r.path == path then
+			if not lo or r.start < lo then lo = r.start end
+			if not hi or r.stop > hi then hi = r.stop end
+		end
+	end
+	if not lo then
+		return nil
+	end
+	return disk_read (lo, hi - lo)
+end
 
 -- /proc/self/maps is the fake one; everything else behaves normally
 io.open = function(path, mode)
@@ -311,6 +355,44 @@ function hook(lib, off, cbs, more)
 		end
 		if r.perms:sub(1, 1) ~= "r" and not S.xom_safe then
 			-- an engine without the execute-only fixes reads the prologue
+			crash(string.format("inline hook on execute-only 0x%x", h.addr))
+		end
+	end
+	hooks[#hooks + 1] = h
+	stdout:write(string.format("H %d %d %s\n", #hooks - 1, h.addr, h.caller or "-"))
+end
+
+-- Interceptor.replace: same install-side checks as hook() (same table, same
+-- "H ..." success line, so :hooks/:unhook on the r2renef side need no
+-- changes), but one callback instead of onEnter/onLeave - the original
+-- never runs; what the callback returns is what :patch's test cares about.
+Interceptor = {}
+
+function Interceptor.replace(lib, off, callback, caller)
+	if type(callback) ~= "function" then
+		error("Interceptor.replace(): callback must be a function")
+	end
+	local base = Module.find(lib)
+	if not base then
+		error("Failed to install native hook")
+	end
+	local h = { addr = base + off, lib = lib, off = off, replace = callback }
+	if caller then
+		local name
+		for _, e in ipairs(Module.exports(lib) or {}) do
+			if e.offset == off then name = e.name end
+		end
+		if not name then
+			error("Failed to install native hook")
+		end
+		h.caller = type(caller) == "table" and table.concat(caller, ",") or caller
+		h.symbol = name
+	else
+		local r = find_range(h.addr)
+		if not r or r.perms:sub(3, 3) ~= "x" then
+			error("Failed to install native hook")
+		end
+		if r.perms:sub(1, 1) ~= "r" and not S.xom_safe then
 			crash(string.format("inline hook on execute-only 0x%x", h.addr))
 		end
 	end
@@ -684,8 +766,13 @@ local function fire(spec)
 		local args = {}
 		for i = 0, 7 do args[i] = tonumber(words[3 + i] or "0") or 0 end
 		in_hook = h
-		if h.onEnter then h.onEnter(args) end
-		if h.onLeave then h.onLeave(tonumber(words[11] or "0") or 0) end
+		if h.replace then
+			local r = h.replace(args)
+			emit(string.format("[mock] replace @%d: original skipped, returned %s", h.addr, tostring(r)))
+		else
+			if h.onEnter then h.onEnter(args) end
+			if h.onLeave then h.onLeave(tonumber(words[11] or "0") or 0) end
+		end
 		in_hook = nil
 	elseif kind == "jhook" then
 		fire_java(words)
