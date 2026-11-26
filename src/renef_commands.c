@@ -37,6 +37,12 @@ static const char HELP[] =
 	"  :unhook <id>|all           remove hook(s)\n"
 	"  :hookgen [addr]            print a hook script template for addr (default $$)\n"
 	"  :bt[*] [addr]              last backtrace captured by a :hook -b hook\n"
+	"  :call <addr> [retType [arg...]]\n"
+	"                             call the function at addr now (default $$); up to 8 args.\n"
+	"                             give retType (void/bool/string/float/double/int/long/pointer,\n"
+	"                             default pointer) to pass args; a number-looking arg is passed\n"
+	"                             as one, anything else as a string; quote an arg (\"...\") to force\n"
+	"                             it to be a string even if it looks like a number\n"
 	"java\n"
 	"  :jc [-n max] [filter]      classes of the app (name contains <filter>)\n"
 	"  :jm [-s] [-a] <class> [filter]\n"
@@ -1446,6 +1452,191 @@ static char *cmd_hookgen(RenefSession *s, const char *args) {
 	return finish (&out);
 }
 
+/* ---- :call ---- */
+
+typedef struct {
+	bool ok;
+	char value[256];
+	char err[256];
+} CallCtx;
+
+static void call_line(void *user, const char *line, size_t len) {
+	CallCtx *ctx = user;
+	if (len >= 1 && line[0] == 'K') {
+		line++;
+		len--;
+		size_t n = len < sizeof (ctx->value) - 1? len: sizeof (ctx->value) - 1;
+		memcpy (ctx->value, line, n);
+		ctx->value[n] = '\0';
+		ctx->ok = true;
+	} else if (len >= 1 && line[0] == 'E') {
+		line++;
+		len--;
+		while (len && *line == ' ') {
+			line++;
+			len--;
+		}
+		size_t n = len < sizeof (ctx->err) - 1? len: sizeof (ctx->err) - 1;
+		memcpy (ctx->err, line, n);
+		ctx->err[n] = '\0';
+	}
+}
+
+/* A token is a number if strtoll (base 0: accepts 0x.., 0.., decimal)
+ * consumes it whole; anything else goes to NativeFunction as a Lua string
+ * (its own marshalling then passes the callee a pointer to its bytes). */
+static bool token_is_number(const char *tok, long long *out) {
+	if (!*tok) {
+		return false;
+	}
+	char *end = NULL;
+	long long v = strtoll (tok, &end, 0);
+	if (end && !*end) {
+		*out = v;
+		return true;
+	}
+	return false;
+}
+
+static char *cmd_call(RenefSession *s, const char *args) {
+	RnBuf out, lua;
+	char *expr = NULL, *ret_type = NULL, *label = NULL;
+	char *argtok[8] = {NULL};
+	int nargs = 0;
+	ut64 addr = 0;
+	const char *usage = "usage: :call <addr> [retType [arg...]]  (up to 8 args; give retType to pass args)\n";
+
+	rn_buf_init (&out);
+	rn_buf_init (&lua);
+
+	const char *p = skip_ws (args);
+	if (!*p) {
+		rn_buf_puts (&out, usage);
+		goto done;
+	}
+	expr = take_token (&p);
+	if (*p) {
+		ret_type = take_token (&p);
+	}
+	while (*p) {
+		if (nargs >= 8) {
+			rn_buf_puts (&out, "too many arguments: :call takes at most 8\n");
+			goto done;
+		}
+		argtok[nargs++] = take_token (&p);
+	}
+
+	if (!eval_addr (s, expr, &addr)) {
+		rn_buf_appendf (&out, "cannot evaluate address '%s'\n", expr);
+		goto done;
+	}
+	if (s->conn.framed? !rn_ranges_refresh (s, &out): !rn_ranges_ensure (s, &out)) {
+		goto done;
+	}
+	const RnRange *range = rn_range_at (s, addr);
+	const RnModule *mod = rn_module_at (s, addr);
+	if (!range) {
+		rn_buf_appendf (&out, "0x%" PFMT64x " is not mapped in the target\n", addr);
+		goto done;
+	}
+	if (!mod) {
+		rn_buf_appendf (&out, "0x%" PFMT64x " is not inside a loaded library (%s); renef calls are addressed as library+offset\n",
+			addr, *range->path? range->path: "anonymous memory");
+		goto done;
+	}
+	if (range->perms[2] != 'x') {
+		rn_buf_appendf (&out, "0x%" PFMT64x " (%s, %s) is not executable: nothing to call there\n",
+			addr, mod->name, range->perms);
+		goto done;
+	}
+	if (addr & 3) {
+		rn_buf_appendf (&out, "0x%" PFMT64x " is not aligned to an AArch64 instruction\n", addr);
+		goto done;
+	}
+	label = r_str_newf ("%s+0x%" PFMT64x, mod->name, addr - mod->base);
+	if (!label) {
+		goto done;
+	}
+
+	const char *lib = rn_module_luaname (mod);
+	bool ok = rn_buf_puts (&lua, "local lib,addr=") && rn_lua_quote (&lua, lib, strlen (lib))
+		&& rn_buf_appendf (&lua, ",0x%" PFMT64x " local b=Module.find(lib) "
+			"if not b then print('" RN_TAG "E the agent does not know '..lib) return end "
+			"if b~=0x%" PFMT64x " then print('" RN_TAG "E '..lib..' resolves to '..string.format('0x%%x',b)"
+			"..' in the agent, not to the module mapped at this address') return end "
+			"local off=addr-b ", addr, mod->base);
+	ok = ok && rn_buf_puts (&lua, "local fn=NativeFunction(b+off");
+	if (ok && ret_type) {
+		ok = rn_buf_puts (&lua, ",") && rn_lua_quote (&lua, ret_type, strlen (ret_type));
+	}
+	ok = ok && rn_buf_puts (&lua, ") local ok,r=pcall(fn");
+	for (int i = 0; ok && i < nargs; i++) {
+		const char *tok = argtok[i];
+		size_t tlen = strlen (tok);
+		/* Blank-delimited, like every other argument in this file: no
+		 * spaces inside one token. Quoting it still has a point - it
+		 * forces a string even when the content reads as a number. */
+		bool quoted = tlen >= 2 && tok[0] == '"' && tok[tlen - 1] == '"';
+		long long v;
+		ok = rn_buf_puts (&lua, ",");
+		if (ok && !quoted && token_is_number (tok, &v)) {
+			ok = rn_buf_appendf (&lua, "%lld", v);
+		} else if (ok && quoted) {
+			ok = rn_lua_quote (&lua, tok + 1, tlen - 2);
+		} else if (ok) {
+			ok = rn_lua_quote (&lua, tok, tlen);
+		}
+	}
+	ok = ok && rn_buf_puts (&lua, ") if ok then print('" RN_TAG "K'..tostring(r)) "
+		"else print('" RN_TAG "E '..tostring(r)) end");
+	if (!ok) {
+		rn_buf_puts (&out, "out of memory\n");
+		goto done;
+	}
+
+	CallCtx ctx;
+	RnBuf reply, other;
+	bool failed = false;
+	memset (&ctx, 0, sizeof (ctx));
+	rn_buf_init (&reply);
+	rn_buf_init (&other);
+	RnStatus st = rn_exec (s, lua.data, 0, &reply);
+	if (st == RN_OK) {
+		rn_scan_reply (s, &reply, call_line, &ctx, &other, &failed);
+	}
+	rn_buf_fini (&reply);
+	if (st != RN_OK || (!ctx.ok && !*ctx.err)) {
+		rn_buf_appendf (&out, "call at %s failed: %s\n", label,
+			st != RN_OK? rn_status_str (st): "the script did not complete");
+		if (other.len) {
+			rn_buf_append (&out, other.data, other.len);
+		}
+		rn_buf_fini (&other);
+		goto done;
+	}
+	rn_buf_fini (&other);
+
+	if (ctx.ok) {
+		rn_buf_appendf (&out, "%s(", label);
+		for (int i = 0; i < nargs; i++) {
+			rn_buf_appendf (&out, "%s%s", i? ", ": "", argtok[i]);
+		}
+		rn_buf_appendf (&out, ") -> %s\n", ctx.value);
+	} else {
+		rn_buf_appendf (&out, "call at %s failed: %s\n", label, *ctx.err? ctx.err: "unknown error");
+	}
+
+done:
+	free (expr);
+	free (ret_type);
+	for (int i = 0; i < nargs; i++) {
+		free (argtok[i]);
+	}
+	free (label);
+	rn_buf_fini (&lua);
+	return finish (&out);
+}
+
 /* ---- :info / :cache / :watch ---- */
 
 static char *cmd_info(RenefSession *s) {
@@ -1585,6 +1776,9 @@ static char *dispatch(RenefSession *s, const char *cmd) {
 	}
 	if (IS ("hookgen") && !star) {
 		return cmd_hookgen (s, args);
+	}
+	if (IS ("call") && !star) {
+		return cmd_call (s, args);
 	}
 	if (IS ("bt")) {
 		return cmd_bt (s, args, star);

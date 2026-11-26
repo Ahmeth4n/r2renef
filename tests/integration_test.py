@@ -620,6 +620,31 @@ def t_hookgen(mode):
           "hookgen requests: %r" % sent)
 
 
+def t_call(mode):
+    r = session(mode, [
+        ":call 0x%x string \"radare2\"" % (LIBC + 0x4240),   # strlen("radare2") -> 7
+        ":call 0x%x int \"hi\"" % (LIBC + 0x4240),           # strlen("hi") -> 2
+        ":call 0x%x long 7 35" % (TARGET + 0x4300),          # mock_sum(7, 35) -> 42
+        ":call 0x%x string 7 35" % (TARGET + 0x4300),        # retType reaches the callee: "sum=42"
+        ":call 0x%x" % (CRYPTO + 0x4000),                    # execute-only, no mock behavior -> default 0
+        ":call 0x%x" % (LIBC + 0x10),                        # mapped, in libc.so, but not executable
+        ":call 0x%x" % (HEAP + 8),                           # mapped, but not inside a loaded library
+        ":call 0x1000",                                      # not mapped at all
+        ":call 0x%x" % (TARGET + 0x4301),                    # not 4-byte aligned
+        ":call",                                             # usage
+    ])
+    has(r.out, 'libc.so+0x4240("radare2") -> 7\n')
+    has(r.out, 'libc.so+0x4240("hi") -> 2\n')
+    has(r.out, "libtarget.so+0x4300(7, 35) -> 42\n")
+    has(r.out, "libtarget.so+0x4300(7, 35) -> sum=42\n")
+    has(r.out, "libcrypto.so+0x4000() -> 0\n")
+    has(r.out, "not executable: nothing to call there\n")
+    has(r.out, "is not inside a loaded library ([anon:scudo:primary])")
+    has(r.out, "not mapped in the target\n")
+    has(r.out, "not aligned to an AArch64 instruction\n")
+    has(r.out, "usage: :call <addr>")
+
+
 def t_scripts(mode):
     script = ('-- a comment with // in it\n'
               'local base = Module.find("libc.so") -- trailing comment\n'
@@ -1072,7 +1097,7 @@ TESTS = [
     (t_write, BOTH), (t_write_unmapped, BOTH), (t_native_search_and_seek, BOTH),
     (t_maps_and_flags, BOTH), (t_maps_modes, BOTH), (t_many_ranges, BOTH),
     (t_hooks, BOTH), (t_hook_safety, BOTH), (t_hooks_from_script, BOTH), (t_hook_custom_body, BOTH),
-    (t_strace, BOTH), (t_search, BOTH), (t_hookgen, BOTH), (t_scripts, BOTH),
+    (t_strace, BOTH), (t_search, BOTH), (t_hookgen, BOTH), (t_call, BOTH), (t_scripts, BOTH),
     (t_stale_reply, BOTH), (t_unsolicited, BOTH), (t_fragmented, BOTH), (t_forced_modes, ("framed",)),
     (t_exec_stall, ("legacy",)), (t_output_queue, ("framed",)),
     (t_java_classes, BOTH), (t_java_hooks, BOTH), (t_java_native, BOTH), (t_java_native_old_agent, ("framed",)),

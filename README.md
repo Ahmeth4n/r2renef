@@ -105,6 +105,7 @@ and the rest of the Renef CLI keep working.
 | `:hook [addr] [-i\|-g[=lib]] [-r] [-b] [-e <lua>]` | hook the function at `addr` (default `$$`) |
 | `:hooks`, `:unhook <id>\|all` | list / remove hooks; flags and comments follow |
 | `:hookgen [addr]` | print a hook script template for `addr` |
+| `:call <addr> [retType [arg...]]` | call the function at `addr` now and print its result; see [Calling a function](#calling-a-function) |
 | `:jc [-n max] [filter]` | classes of the app whose name contains `filter` |
 | `:jm [-s] [-a] <class> [filter]` | methods and constructors of a class (`-s`: with JNI signatures, `-a`: compiler-made ones too) |
 | `:jhook <class> <method> [(types)] [options]` | hook a Java method; see [Java methods](#java-methods) |
@@ -150,6 +151,32 @@ Two kinds of hook exist and they are not interchangeable:
   pointers, not libraries loaded later. The agent patches at most 64 GOT slots
   per hook, so `-g` alone on a popular libc function covers only some callers:
   name the caller.
+
+### Calling a function
+
+`:call` runs the function at an address right now, with the arguments you
+give it, and prints what it returns - no hook, no script:
+
+```bash
+[0x7000004240]> :call sym.libc.so.strlen string "hello"
+libc.so+0x4240("hello") -> 5
+[0x7100004300]> :call $$ long 7 35
+libtarget.so+0x4300(7, 35) -> 42
+```
+
+`retType` (`void`, `bool`, `string`, `float`, `double`, `int`, `long` or
+`pointer`, default `pointer`) is only needed to pass arguments - write
+`pointer` if you do not care about it. Up to 8 arguments: one that reads as a
+number is passed as one; anything else, as a string. Quote an argument
+(`"..."`) to force it to be a string even when it looks like a number - there
+is no other way to tell `:call 0x1234 string 42` from `:call 0x1234 string
+"42"` apart. Like every other argument in this file, a token cannot contain a
+space.
+
+A failed call (the address is not mapped, not inside a loaded library, not
+executable, or the callee itself errors) prints why instead of a result.
+`:call` never writes to the target's code - it is safe to use on
+execute-only (`xom`) functions that `:hook -i` would refuse.
 
 ### Java methods
 

@@ -132,7 +132,8 @@ class FakeProcess:
         self._add(LIBC_BASE + 0x12000, 0x2000, "rw-p", "[anon:.bss]")
 
         self._lib(LIBTARGET, LIBTARGET_BASE, "r-xp",
-                  [("JNI_OnLoad", 0x4100), ("Java_com_example_app_MainActivity_check", 0x4140)],
+                  [("JNI_OnLoad", 0x4100), ("Java_com_example_app_MainActivity_check", 0x4140),
+                   ("mock_sum", 0x4300)],
                   symbols=[("secret_check", 0x4200)])
         # execute-only text, as on devices that enforce XOM for system libraries
         self._lib(LIBCRYPTO, LIBCRYPTO_BASE, "--xp",

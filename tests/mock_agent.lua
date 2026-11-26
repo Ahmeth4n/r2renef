@@ -155,6 +155,35 @@ end
 function Module.exports(name) return sym_table("exports", name) end
 function Module.symbols(name) return sym_table("symbols", name) end
 
+-- Minimal NativeFunction for :call's tests: no real ARM64 call happens
+-- here, so a couple of well-known addresses behave like a real function
+-- would (receiving the actual Lua args/ret_type, not marshalled bytes);
+-- anything else returns 0, so the plumbing (arg encoding, retType, error
+-- paths) is still exercised deterministically.
+local NATIVE_FNS = {}
+
+function NativeFunction(addr, ret_type)
+	local fn = NATIVE_FNS[addr]
+	return function(...)
+		if not fn then
+			return 0
+		end
+		return fn(ret_type, ...)
+	end
+end
+
+NATIVE_FNS[Module.find("libc.so") + 0x4240] = function(_, s) -- strlen
+	return #tostring(s)
+end
+
+NATIVE_FNS[Module.find("libtarget.so") + 0x4300] = function(ret_type, a, b) -- mock_sum
+	local sum = (tonumber(a) or 0) + (tonumber(b) or 0)
+	if ret_type == "string" then
+		return "sum=" .. sum
+	end
+	return sum
+end
+
 Memory = {}
 
 function Memory.read(addr, size)
