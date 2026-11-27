@@ -203,7 +203,7 @@ static bool __getbase(RIODesc *desc, ut64 *base) {
 
 RIOPlugin r_io_plugin_r2renef = {
 	.meta = {
-		.name = "r2renef",
+		.name = "renef",
 		.desc = "Renef IO plugin for radare2 (renef://[host[:port]/]spawn/<pkg> or attach/<pid>)",
 		.license = "MIT",
 	},
